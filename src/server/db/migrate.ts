@@ -96,10 +96,21 @@ export async function migrate(db: DatabaseContext) {
       upstream_name TEXT,
       created_at TEXT NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS network_interfaces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      address TEXT NOT NULL,
+      family TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
     `CREATE TABLE IF NOT EXISTS proxy_routes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL UNIQUE,
       protocol TEXT NOT NULL,
+      network_interface_id INTEGER,
       listen_address TEXT NOT NULL,
       listen_port INTEGER NOT NULL,
       source_host TEXT,
@@ -113,7 +124,8 @@ export async function migrate(db: DatabaseContext) {
       health_status TEXT NOT NULL DEFAULT 'unknown',
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(network_interface_id) REFERENCES network_interfaces(id) ON DELETE SET NULL
     )`,
     `CREATE TABLE IF NOT EXISTS proxy_request_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,10 +324,21 @@ export async function migrate(db: DatabaseContext) {
       upstream_name TEXT,
       created_at TIMESTAMPTZ NOT NULL
     )`,
+    `CREATE TABLE IF NOT EXISTS network_interfaces (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      address TEXT NOT NULL,
+      family TEXT NOT NULL,
+      enabled BOOLEAN NOT NULL DEFAULT TRUE,
+      is_default BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
     `CREATE TABLE IF NOT EXISTS proxy_routes (
       id SERIAL PRIMARY KEY,
       name TEXT NOT NULL UNIQUE,
       protocol TEXT NOT NULL,
+      network_interface_id INTEGER REFERENCES network_interfaces(id) ON DELETE SET NULL,
       listen_address TEXT NOT NULL,
       listen_port INTEGER NOT NULL,
       source_host TEXT,
@@ -436,11 +459,13 @@ export async function migrate(db: DatabaseContext) {
     db.driver === "postgres"
       ? [
           `ALTER TABLE certificate_authorities ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT FALSE`,
-          `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER REFERENCES certificate_subjects(id) ON DELETE RESTRICT`
+          `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER REFERENCES certificate_subjects(id) ON DELETE RESTRICT`,
+          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER REFERENCES network_interfaces(id) ON DELETE SET NULL`
         ]
       : [
           `ALTER TABLE certificate_authorities ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0`,
-          `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER`
+          `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER`,
+          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER`
         ];
 
   for (const statement of alterStatements) {
@@ -450,4 +475,37 @@ export async function migrate(db: DatabaseContext) {
       // ignore duplicate-column errors for existing databases
     }
   }
+
+  const normalizeProxyRoutesStatement =
+    db.driver === "postgres"
+      ? `UPDATE proxy_routes
+         SET
+           listen_address = '0.0.0.0',
+           listen_port = CASE
+             WHEN protocol = 'http' THEN 80
+             WHEN protocol = 'https' THEN 443
+             ELSE listen_port
+           END
+         WHERE protocol IN ('http', 'https')
+           AND (
+             listen_address <> '0.0.0.0'
+             OR (protocol = 'http' AND listen_port <> 80)
+             OR (protocol = 'https' AND listen_port <> 443)
+           )`
+      : `UPDATE proxy_routes
+         SET
+           listen_address = '0.0.0.0',
+           listen_port = CASE
+             WHEN protocol = 'http' THEN 80
+             WHEN protocol = 'https' THEN 443
+             ELSE listen_port
+           END
+         WHERE protocol IN ('http', 'https')
+           AND (
+             listen_address <> '0.0.0.0'
+             OR (protocol = 'http' AND listen_port <> 80)
+             OR (protocol = 'https' AND listen_port <> 443)
+           )`;
+
+  await db.run(normalizeProxyRoutesStatement);
 }
