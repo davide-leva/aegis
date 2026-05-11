@@ -3,6 +3,7 @@ export type DatabaseDriver = "postgres" | "sqlite";
 export type AuditAction =
   | "bootstrap.read"
   | "bootstrap.create"
+  | "bootstrap.update"
   | "dashboard.read"
   | "zone.list"
   | "zone.create"
@@ -52,6 +53,7 @@ export type AuditAction =
   | "certificate.server.list"
   | "certificate.server.create"
   | "certificate.server.renew"
+  | "certificate.server.delete"
   | "certificate.download"
   | "docker.dashboard.read"
   | "docker.environment.list"
@@ -61,7 +63,10 @@ export type AuditAction =
   | "docker.container.list"
   | "docker.container.read"
   | "docker.mapping.create"
-  | "docker.mapping.automap";
+  | "docker.mapping.delete"
+  | "docker.mapping.automap"
+  | "network.interface.list"
+  | "network.interface.sync";
 
 export type EventTopic =
   | "dns.bootstrap.completed"
@@ -95,12 +100,14 @@ export type EventTopic =
   | "certificate.ca.defaulted"
   | "certificate.server.created"
   | "certificate.server.renewed"
+  | "certificate.server.deleted"
   | "docker.environment.created"
   | "docker.environment.updated"
   | "docker.environment.deleted"
   | "docker.mapping.created"
   | "docker.mapping.automapped"
-  | "docker.mapping.automap_failed";
+  | "docker.mapping.automap_failed"
+  | "docker.mapping.deleted";
 
 export interface BootstrapSettings {
   organizationName: string;
@@ -109,6 +116,13 @@ export interface BootstrapSettings {
   upstreamMode: "redundant" | "strict";
   dnsListenPort: number;
   blocklistEnabled: boolean;
+}
+
+export interface BootstrapStatus {
+  dnsConfigured: boolean;
+  primaryCaConfigured: boolean;
+  interfacesConfigured: boolean;
+  completed: boolean;
 }
 
 export interface ResolverSettings extends BootstrapSettings {
@@ -164,6 +178,17 @@ export interface BlocklistEntry {
   kind: "domain" | "suffix" | "regex";
   source: string | null;
   enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NetworkInterface {
+  id: number;
+  name: string;
+  address: string;
+  family: "ipv4" | "ipv6";
+  enabled: boolean;
+  isDefault: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -250,6 +275,7 @@ export interface ProxyRoute {
   id: number;
   name: string;
   protocol: "http" | "https" | "tcp" | "udp";
+  networkInterfaceId: number | null;
   listenAddress: string;
   listenPort: number;
   sourceHost: string | null;

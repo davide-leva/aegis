@@ -10,6 +10,7 @@ import { DnsZoneRepository } from "./dns-zone-repository.js";
 import { DockerEnvironmentRepository } from "./docker-environment-repository.js";
 import { DockerPortMappingRepository } from "./docker-port-mapping-repository.js";
 import { EventRepository } from "./event-repository.js";
+import { NetworkInterfaceRepository } from "./network-interface-repository.js";
 import { ProxyRequestLogRepository } from "./proxy-request-log-repository.js";
 import { ProxyRouteRepository } from "./proxy-route-repository.js";
 import { ResolverSettingsRepository } from "./resolver-settings-repository.js";
@@ -24,6 +25,7 @@ export function createRepositories(db: DatabaseContext) {
     serverCertificates: new ServerCertificateRepository(db),
     dockerEnvironments: new DockerEnvironmentRepository(db),
     dockerPortMappings: new DockerPortMappingRepository(db),
+    networkInterfaces: new NetworkInterfaceRepository(db),
     zones: new DnsZoneRepository(db),
     records: new DnsRecordRepository(db),
     queryLogs: new DnsQueryLogRepository(db),
