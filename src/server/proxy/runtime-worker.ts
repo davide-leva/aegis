@@ -3,11 +3,13 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import { parentPort } from "node:worker_threads";
+import tls from "node:tls";
 import { URL } from "node:url";
 
 import httpProxy from "http-proxy";
 
 import { createDb } from "../db/client.js";
+import { createPrivilegedPortError, hasPrivilegedPortAccess, isPrivilegedPort, normalizePrivilegedBindError } from "../lib/privileged-ports.js";
 import { createRepositories } from "../repositories/index.js";
 import type { ProxyRequestLogEntry, ProxyRoute, ProxyRuntimeStatus } from "../types.js";
 
@@ -69,8 +71,21 @@ async function loadConfiguration() {
 
   try {
     const grouped = groupRoutes(routes);
+    assertNoListenerConflicts(Array.from(grouped.values()));
+    const privilegedListeners = Array.from(grouped.values())
+      .filter((group) => isPrivilegedPort(group.listenPort))
+      .map((group) => ({
+        runtime: "proxy" as const,
+        protocol: group.protocol,
+        address: group.listenAddress,
+        port: group.listenPort
+      }));
+    if (privilegedListeners.length > 0 && !hasPrivilegedPortAccess()) {
+      throw createPrivilegedPortError(privilegedListeners);
+    }
+    const httpsRoutes = grouped.get("https:0.0.0.0:443")?.routes ?? [];
     for (const [key, group] of grouped.entries()) {
-      const handle = await createListener(group);
+      const handle = await createListener(group, httpsRoutes);
       nextListeners.push(handle);
       listenerState.push({
         protocol: group.protocol,
@@ -87,7 +102,18 @@ async function loadConfiguration() {
     });
   } catch (error) {
     await Promise.all(nextListeners.map((listener) => listener.close().catch(() => undefined)));
-    const message = error instanceof Error ? error.message : "Unknown proxy runtime error";
+    const normalized = normalizePrivilegedBindError(
+      error,
+      routes
+        .filter((route) => isPrivilegedPort(route.listenPort))
+        .map((route) => ({
+          runtime: "proxy" as const,
+          protocol: route.protocol,
+          address: route.listenAddress,
+          port: route.listenPort
+        }))
+    );
+    const message = normalized.message;
     parentPort?.postMessage({ type: "runtime-error", error: message });
     pushStatus({
       state: "error",
@@ -173,9 +199,86 @@ function groupRoutes(routes: ProxyRoute[]) {
   return groups;
 }
 
-async function createListener(group: RouteGroup): Promise<ListenerHandle> {
+function assertNoListenerConflicts(groups: RouteGroup[]) {
+  for (let index = 0; index < groups.length; index += 1) {
+    for (let nextIndex = index + 1; nextIndex < groups.length; nextIndex += 1) {
+      const current = groups[index];
+      const next = groups[nextIndex];
+      if (!listenerGroupsConflict(current, next)) {
+        continue;
+      }
+      throw new Error(
+        `Listener conflict: ${describeListener(current.protocol, current.listenAddress, current.listenPort)} overlaps with ${describeListener(next.protocol, next.listenAddress, next.listenPort)}`
+      );
+    }
+  }
+}
+
+function listenerGroupsConflict(left: RouteGroup, right: RouteGroup) {
+  if (left.listenPort !== right.listenPort) {
+    return false;
+  }
+
+  if (transportFamily(left.protocol) !== transportFamily(right.protocol)) {
+    return false;
+  }
+
+  if (left.protocol === right.protocol && left.listenAddress === right.listenAddress) {
+    return false;
+  }
+
+  return addressesOverlap(left.listenAddress, right.listenAddress);
+}
+
+function transportFamily(protocol: ProxyRoute["protocol"]) {
+  return protocol === "udp" ? "udp" : "tcp";
+}
+
+function addressesOverlap(left: string, right: string) {
+  const normalizedLeft = normalizeListenerAddress(left);
+  const normalizedRight = normalizeListenerAddress(right);
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  if (isWildcardAddress(normalizedLeft) || isWildcardAddress(normalizedRight)) {
+    return sameIpFamily(normalizedLeft, normalizedRight);
+  }
+  return false;
+}
+
+function normalizeListenerAddress(address: string) {
+  return address.trim().toLowerCase();
+}
+
+function isWildcardAddress(address: string) {
+  return address === "0.0.0.0" || address === "::" || address === "[::]";
+}
+
+function sameIpFamily(left: string, right: string) {
+  if (isIpv4Address(left) && (isIpv4Address(right) || right === "0.0.0.0")) {
+    return true;
+  }
+  if ((left === "::" || left === "[::]" || isIpv6Address(left)) && (right === "::" || right === "[::]" || isIpv6Address(right))) {
+    return true;
+  }
+  return false;
+}
+
+function isIpv4Address(address: string) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address);
+}
+
+function isIpv6Address(address: string) {
+  return address.includes(":");
+}
+
+function describeListener(protocol: string, address: string, port: number) {
+  return `${protocol.toUpperCase()} ${address}:${port}`;
+}
+
+async function createListener(group: RouteGroup, httpsRoutes: ProxyRoute[] = []): Promise<ListenerHandle> {
   if (group.protocol === "http" || group.protocol === "https") {
-    return createHttpListener(group);
+    return createHttpListener(group, httpsRoutes);
   }
   if (group.protocol === "tcp") {
     return createTcpListener(group);
@@ -183,7 +286,7 @@ async function createListener(group: RouteGroup): Promise<ListenerHandle> {
   return createUdpListener(group);
 }
 
-async function createHttpListener(group: RouteGroup): Promise<ListenerHandle> {
+async function createHttpListener(group: RouteGroup, httpsRoutes: ProxyRoute[] = []): Promise<ListenerHandle> {
   const requestHandler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const startedAt = Date.now();
     const clientIp = extractClientIp(req.socket.remoteAddress);
@@ -192,6 +295,12 @@ async function createHttpListener(group: RouteGroup): Promise<ListenerHandle> {
     const route = selectHttpRoute(group.routes, hostHeader, pathname);
 
     if (!route) {
+      if (group.protocol === "http" && selectHttpRoute(httpsRoutes, hostHeader, pathname)) {
+        const location = `https://${hostHeader}${req.url ?? "/"}`;
+        res.writeHead(301, { Location: location });
+        res.end();
+        return;
+      }
       res.statusCode = 404;
       res.end("No proxy route matched");
       await logProxyRequest({
@@ -285,8 +394,9 @@ async function createHttpListener(group: RouteGroup): Promise<ListenerHandle> {
     group.protocol === "https"
       ? https.createServer(
           {
-            cert: group.routes[0].tlsCertPem ?? undefined,
-            key: group.routes[0].tlsKeyPem ?? undefined
+            cert: selectDefaultTlsRoute(group.routes)?.tlsCertPem ?? undefined,
+            key: selectDefaultTlsRoute(group.routes)?.tlsKeyPem ?? undefined,
+            SNICallback: createSniCallback(group.routes)
           },
           requestHandler
         )
@@ -366,6 +476,35 @@ function createTcpListener(group: RouteGroup): Promise<ListenerHandle> {
   return listenServer(server, group.listenPort, group.listenAddress).then(() => ({
     close: () => closeServer(server)
   }));
+}
+
+function createSniCallback(routes: ProxyRoute[]) {
+  const contexts = new Map<string, tls.SecureContext>();
+
+  for (const route of routes) {
+    if (!route.sourceHost || !route.tlsCertPem || !route.tlsKeyPem) {
+      continue;
+    }
+    contexts.set(
+      route.sourceHost.toLowerCase(),
+      tls.createSecureContext({
+        cert: route.tlsCertPem,
+        key: route.tlsKeyPem
+      })
+    );
+  }
+
+  return (servername: string, callback: (error: Error | null, context?: tls.SecureContext) => void) => {
+    callback(null, contexts.get(servername.toLowerCase()));
+  };
+}
+
+function selectDefaultTlsRoute(routes: ProxyRoute[]) {
+  return (
+    routes.find((route) => route.sourceHost == null && route.tlsCertPem && route.tlsKeyPem) ??
+    routes.find((route) => route.tlsCertPem && route.tlsKeyPem) ??
+    null
+  );
 }
 
 function createUdpListener(group: RouteGroup): Promise<ListenerHandle> {
@@ -470,7 +609,8 @@ function normalizeRoute(route: ProxyRoute): ProxyRoute {
   return {
     ...route,
     sourceHost: route.sourceHost?.toLowerCase() ?? null,
-    sourcePath: normalizePath(route.sourcePath)
+    sourcePath: normalizePath(route.sourcePath),
+    listenAddress: (route.protocol === "http" || route.protocol === "https") ? "0.0.0.0" : route.listenAddress
   };
 }
 

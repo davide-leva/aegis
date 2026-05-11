@@ -8,6 +8,7 @@ import { ProxyService } from "../services/proxy-service.js";
 const routeSchema = z.object({
   name: z.string().min(2).max(120),
   protocol: z.enum(["http", "https", "tcp", "udp"]),
+  networkInterfaceId: z.number().int().positive().nullable(),
   listenAddress: z.string().min(2).max(255),
   listenPort: z.number().int().min(1).max(65535),
   sourceHost: z.string().max(255).nullable(),

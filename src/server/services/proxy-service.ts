@@ -1,5 +1,6 @@
 import { EventBus } from "../events/event-bus.js";
-import type { AuditContext, ProxyRuntimeStatus } from "../types.js";
+import { getCanonicalProxyListener } from "../lib/proxy-listeners.js";
+import type { AuditContext, NetworkInterface, ProxyRuntimeStatus } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
 import type { NewProxyRoute } from "../repositories/proxy-route-repository.js";
 
@@ -16,7 +17,10 @@ export class ProxyService {
   ) {}
 
   async getDashboard(context: AuditContext) {
-    const routes = await this.repositories.proxyRoutes.list();
+    const [routes, managedRouteIds] = await Promise.all([
+      this.repositories.proxyRoutes.list(),
+      this.repositories.dockerPortMappings.listManagedProxyRouteIds()
+    ]);
     const dashboard = {
       summary: {
         routes: routes.length,
@@ -25,7 +29,8 @@ export class ProxyService {
         tcpListeners: countListenerGroups(routes, ["tcp"]),
         udpListeners: countListenerGroups(routes, ["udp"])
       },
-      routes
+      routes,
+      managedRouteIds
     };
 
     await this.audit("proxy.dashboard.read", "proxy_dashboard", null, context, {
@@ -44,12 +49,13 @@ export class ProxyService {
   }
 
   async createRoute(input: NewProxyRoute, context: AuditContext) {
-    await this.validateRouteInput(input);
+    const normalizedInput = await normalizeProxyRouteInput(input, this.repositories);
+    await this.validateRouteInput(normalizedInput);
     const route = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
       const events = new EventBus(repos);
-      await this.validateRouteInput(input, repos);
-      const route = await repos.proxyRoutes.create(input);
+      await this.validateRouteInput(normalizedInput, repos);
+      const route = await repos.proxyRoutes.create(normalizedInput);
       await repos.audit.create({
         action: "proxy.route.create",
         entityType: "proxy_route",
@@ -73,7 +79,8 @@ export class ProxyService {
   }
 
   async updateRoute(id: number, input: NewProxyRoute, context: AuditContext) {
-    await this.validateRouteInput(input, this.repositories, id);
+    const normalizedInput = await normalizeProxyRouteInput(input, this.repositories);
+    await this.validateRouteInput(normalizedInput, this.repositories, id);
     const route = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
       const events = new EventBus(repos);
@@ -81,8 +88,8 @@ export class ProxyService {
       if (!existing) {
         throw new Error("Proxy route not found");
       }
-      await this.validateRouteInput(input, repos, id);
-      const route = await repos.proxyRoutes.update(id, input);
+      await this.validateRouteInput(normalizedInput, repos, id);
+      const route = await repos.proxyRoutes.update(id, normalizedInput);
       await repos.audit.create({
         action: "proxy.route.update",
         entityType: "proxy_route",
@@ -213,6 +220,15 @@ export class ProxyService {
   }
 
   private async validateRouteInput(input: NewProxyRoute, repos = this.repositories, currentId?: number) {
+    if (input.networkInterfaceId == null) {
+      throw new Error("A network interface is required");
+    }
+
+    const networkInterface = await repos.networkInterfaces.getById(input.networkInterfaceId);
+    if (!networkInterface || !networkInterface.enabled) {
+      throw new Error("Selected network interface is not available");
+    }
+
     if (input.protocol === "https" && (!input.tlsCertPem || !input.tlsKeyPem)) {
       throw new Error("HTTPS routes require both TLS certificate and private key");
     }
@@ -241,10 +257,16 @@ export class ProxyService {
       if (currentId && route.id === currentId) {
         continue;
       }
+      const normalizedRoute = normalizeRouteListenerAddress(route);
+      if (listenersConflict(normalizedRoute, input)) {
+        throw new Error(
+          `Listener conflict: ${describeListener(input.protocol, input.listenAddress, input.listenPort)} overlaps with existing ${describeListener(route.protocol, route.listenAddress, route.listenPort)}`
+        );
+      }
       if (
-        route.protocol === input.protocol &&
-        route.listenAddress === input.listenAddress &&
-        route.listenPort === input.listenPort
+        normalizedRoute.protocol === input.protocol &&
+        normalizedRoute.listenAddress === input.listenAddress &&
+        normalizedRoute.listenPort === input.listenPort
       ) {
         if (input.protocol === "tcp" || input.protocol === "udp") {
           throw new Error(`A ${input.protocol.toUpperCase()} listener already exists on ${input.listenAddress}:${input.listenPort}`);
@@ -256,16 +278,44 @@ export class ProxyService {
           throw new Error("A proxy route with the same listener, host and path already exists");
         }
 
-        if (input.protocol === "https") {
-          const hasDifferentTls =
-            (route.tlsCertPem ?? "") !== (input.tlsCertPem ?? "") || (route.tlsKeyPem ?? "") !== (input.tlsKeyPem ?? "");
-          if (hasDifferentTls) {
-            throw new Error("HTTPS routes sharing the same listener must use the same certificate pair");
-          }
-        }
       }
     }
   }
+}
+
+async function normalizeProxyRouteInput(input: NewProxyRoute, repos: Repositories): Promise<NewProxyRoute> {
+  const networkInterface = await resolveNetworkInterface(input.networkInterfaceId, repos);
+  const listener = getCanonicalProxyListener(input.protocol, networkInterface.address);
+  if (!listener) {
+    return {
+      ...input,
+      networkInterfaceId: networkInterface.id,
+      listenAddress: networkInterface.address,
+      listenPort: input.listenPort
+    };
+  }
+
+  return {
+    ...input,
+    networkInterfaceId: networkInterface.id,
+    listenAddress: listener.listenAddress,
+    listenPort: listener.listenPort
+  };
+}
+
+async function resolveNetworkInterface(networkInterfaceId: number | null, repos: Repositories): Promise<NetworkInterface> {
+  if (networkInterfaceId != null) {
+    const exact = await repos.networkInterfaces.getById(networkInterfaceId);
+    if (exact) {
+      return exact;
+    }
+  }
+
+  const fallback = await repos.networkInterfaces.getDefault();
+  if (!fallback) {
+    throw new Error("Configure at least one default network interface before publishing proxy routes");
+  }
+  return fallback;
 }
 
 function normalizeHost(value: string | null) {
@@ -287,4 +337,76 @@ function countListenerGroups(routes: Array<{ protocol: string; enabled: boolean;
       .map((route) => `${route.protocol}:${route.listenAddress}:${route.listenPort}`)
   );
   return keys.size;
+}
+
+function normalizeRouteListenerAddress<T extends { protocol: string; listenAddress: string }>(route: T): T {
+  if (route.protocol === "http" || route.protocol === "https") {
+    return { ...route, listenAddress: "0.0.0.0" };
+  }
+  return route;
+}
+
+function listenersConflict(
+  existing: Pick<NewProxyRoute, "protocol" | "listenAddress" | "listenPort">,
+  candidate: Pick<NewProxyRoute, "protocol" | "listenAddress" | "listenPort">
+) {
+  if (existing.listenPort !== candidate.listenPort) {
+    return false;
+  }
+
+  if (transportFamily(existing.protocol) !== transportFamily(candidate.protocol)) {
+    return false;
+  }
+
+  if (existing.protocol === candidate.protocol && existing.listenAddress === candidate.listenAddress) {
+    return false;
+  }
+
+  return addressesOverlap(existing.listenAddress, candidate.listenAddress);
+}
+
+function transportFamily(protocol: NewProxyRoute["protocol"]) {
+  return protocol === "udp" ? "udp" : "tcp";
+}
+
+function addressesOverlap(left: string, right: string) {
+  const normalizedLeft = normalizeListenerAddress(left);
+  const normalizedRight = normalizeListenerAddress(right);
+  if (normalizedLeft === normalizedRight) {
+    return true;
+  }
+  if (isWildcardAddress(normalizedLeft) || isWildcardAddress(normalizedRight)) {
+    return sameIpFamily(normalizedLeft, normalizedRight);
+  }
+  return false;
+}
+
+function normalizeListenerAddress(address: string) {
+  return address.trim().toLowerCase();
+}
+
+function isWildcardAddress(address: string) {
+  return address === "0.0.0.0" || address === "::" || address === "[::]";
+}
+
+function sameIpFamily(left: string, right: string) {
+  if (isIpv4Address(left) && (isIpv4Address(right) || right === "0.0.0.0")) {
+    return true;
+  }
+  if ((left === "::" || left === "[::]" || isIpv6Address(left)) && (right === "::" || right === "[::]" || isIpv6Address(right))) {
+    return true;
+  }
+  return false;
+}
+
+function isIpv4Address(address: string) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(address);
+}
+
+function isIpv6Address(address: string) {
+  return address.includes(":");
+}
+
+function describeListener(protocol: string, address: string, port: number) {
+  return `${protocol.toUpperCase()} ${address}:${port}`;
 }
