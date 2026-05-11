@@ -4,7 +4,9 @@ import { AppShell } from "./components/layout/app-shell";
 import { CertificatesPage } from "./pages/certificates-page";
 import { DnsPage } from "./pages/dns-page";
 import { DockerPage } from "./pages/docker-page";
+import { MappingsPage } from "./pages/mappings-page";
 import { ProxyPage } from "./pages/proxy-page";
+import { SystemPage } from "./pages/system-page";
 
 export function App() {
   return (
@@ -17,6 +19,8 @@ export function App() {
         element={<ProxyPage />}
       />
       <Route path="/docker/*" element={<DockerPage />} />
+      <Route path="/mappings" element={<MappingsPage />} />
+      <Route path="/system" element={<SystemPage />} />
       <Route
         path="/network"
         element={<PlaceholderPage title="Network Policy" description="LAN-wide policy controls and service exposure boundaries will be managed here." />}

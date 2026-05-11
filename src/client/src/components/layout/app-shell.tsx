@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import {
   Boxes,
+  Cable,
+  Cpu,
   FileKey2,
   Globe2,
   Network,
@@ -25,6 +27,8 @@ const navigation = [
   { to: "/certificates", label: "CA & Certificates", icon: FileKey2, available: true },
   { to: "/proxy", label: "Proxy", icon: ShieldCheck, available: true },
   { to: "/docker", label: "Docker Discovery", icon: Boxes, available: true },
+  { to: "/mappings", label: "Mappings", icon: Cable, available: true },
+  { to: "/system", label: "System", icon: Cpu, available: true },
   { to: "/network", label: "Network Policy", icon: Network, available: false },
   { to: "/audit", label: "Audit Trail", icon: Waypoints, available: false }
 ];
@@ -39,10 +43,9 @@ export function AppShell({ title, description, eyebrow = "Aegis Control Plane", 
             <div className="rounded-md border border-primary/20 bg-primary/10 p-2">
               <Shield className="h-5 w-5 text-primary" />
             </div>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-primary">Aegis</p>
-              <h1 className="mt-1 text-lg font-semibold text-foreground">Enterprise LAN Services</h1>
-              <p className="mt-1 text-sm text-muted-foreground">DNS first, then certificates, proxy and container activation flows.</p>
+            <div className="flex flex-col justify-center">
+              <p className="text-xl font-semibold uppercase tracking-[0.16em] text-primary">Aegis</p>
+              {/* <h1 className="mt-1 text-lg font-semibold text-foreground">Enterprise LAN Services</h1> */}
             </div>
           </div>
 
@@ -55,7 +58,9 @@ export function AppShell({ title, description, eyebrow = "Aegis Control Plane", 
                   cn(
                     "flex items-center justify-between rounded-md px-3 py-3 text-sm transition-colors",
                     item.available ? "hover:bg-secondary/70" : "cursor-default opacity-65",
-                    isActive && item.available ? "bg-secondary text-foreground" : "text-muted-foreground"
+                    isActive && item.available
+                      ? "border-l-2 border-primary bg-secondary pl-[10px] font-medium text-foreground"
+                      : "border-l-2 border-transparent text-muted-foreground"
                   )
                 }
                 onClick={(event) => {
@@ -77,12 +82,6 @@ export function AppShell({ title, description, eyebrow = "Aegis Control Plane", 
             ))}
           </nav>
 
-          <div className="mt-6 rounded-md border border-border bg-background/40 p-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-primary">Roadmap</p>
-            <p className="mt-2 text-sm text-muted-foreground">
-              The DNS slice is live. The next surfaces are certificate issuance, reverse proxy publication and container onboarding.
-            </p>
-          </div>
         </aside>
 
           <main className="mt-4 min-w-0 space-y-8 rounded-xl border border-border bg-card/60 px-4 py-4 shadow-panel backdrop-blur lg:mt-0 lg:h-[calc(100vh-2rem)] lg:overflow-auto lg:px-8 lg:py-6 2xl:px-10">
