@@ -1,20 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Activity,
   Ban,
   Globe,
+  Lock,
   Network,
   Pencil,
   Plus,
-  RefreshCcw,
   ServerCog,
-  ShieldAlert,
   Trash2
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 
 import { AppShell } from "@/components/layout/app-shell";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -33,7 +32,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-
 type Settings = {
   organizationName: string;
   primaryContactEmail: string;
@@ -88,6 +86,12 @@ type BlocklistEntry = {
 
 type Dashboard = {
   bootstrapCompleted: boolean;
+  bootstrapSteps?: {
+    dnsConfigured: boolean;
+    primaryCaConfigured: boolean;
+    interfacesConfigured: boolean;
+    completed: boolean;
+  };
   settings: Settings | null;
   summary: {
     zones: number;
@@ -103,55 +107,51 @@ type Dashboard = {
   blocklist: BlocklistEntry[];
 };
 
-type RuntimeStatus = {
-  state: "starting" | "running" | "idle" | "error" | "stopped";
-  pid: number | null;
-  restarts: number;
-  lastStartedAt: string | null;
-  lastHeartbeatAt: string | null;
-  lastError: string | null;
-  listening: {
-    udpPort: number | null;
-    tcpPort: number | null;
-    address: string | null;
+type BootstrapState = {
+  bootstrapCompleted: boolean;
+  steps: {
+    dnsConfigured: boolean;
+    primaryCaConfigured: boolean;
+    interfacesConfigured: boolean;
+    completed: boolean;
   };
+  settings: Settings | null;
+  certificateAuthority: {
+    id: number;
+    name: string;
+    commonName: string;
+    expiresAt: string;
+    isDefault: boolean;
+  } | null;
 };
 
-type RuntimeMetrics = {
-  totalQueries: number;
-  authoritativeQueries: number;
-  upstreamQueries: number;
-  blockedQueries: number;
-  nxDomainQueries: number;
-  servfailQueries: number;
-  avgDurationMs: number;
-  lastQueryAt: string | null;
+type BootstrapCaForm = {
+  name: string;
+  commonName: string;
+  organization: string;
+  organizationalUnit: string;
+  country: string;
+  state: string;
+  locality: string;
+  emailAddress: string;
+  validityDays: number;
+  pathLength: number | null;
 };
 
-type RuntimeLog = {
-  id: number;
-  protocol: "udp" | "tcp";
-  clientIp: string | null;
-  questionName: string;
-  questionType: string;
-  resolutionMode: string;
-  responseCode: string;
-  answerCount: number;
-  durationMs: number;
-  zoneName: string | null;
-  upstreamName: string | null;
-  createdAt: string;
+type NetworkInterfaceConfig = {
+  id?: number;
+  name: string;
+  address: string;
+  family: "ipv4" | "ipv6";
+  enabled: boolean;
+  isDefault: boolean;
 };
 
-type EventItem = {
-  id: number;
-  topic: string;
-  aggregateType: string;
-  aggregateId: string;
-  payload: string;
-  metadata: string | null;
-  createdAt: string;
+type NetworkInterfacesState = {
+  availableInterfaces: NetworkInterfaceConfig[];
+  interfaces: NetworkInterfaceConfig[];
 };
+
 
 type BootstrapForm = Settings;
 type ZoneForm = Omit<Zone, "id"> & { description: string };
@@ -163,8 +163,7 @@ const dnsTabs = [
   { value: "zones", label: "Zones" },
   { value: "records", label: "Records" },
   { value: "upstreams", label: "Upstreams" },
-  { value: "blocklist", label: "Blocklist" },
-  { value: "runtime", label: "Runtime" }
+  { value: "blocklist", label: "Blocklist" }
 ];
 
 const createLabels: Record<string, string> = {
@@ -178,53 +177,38 @@ export function DnsPage() {
   const [activeTab, setActiveTab] = useState("zones");
   const queryClient = useQueryClient();
   const refreshDashboard = () => queryClient.invalidateQueries({ queryKey: ["dns-dashboard"] });
-  const refreshRuntime = () => {
-    queryClient.invalidateQueries({ queryKey: ["dns-runtime-status"] });
-    queryClient.invalidateQueries({ queryKey: ["dns-runtime-metrics"] });
-    queryClient.invalidateQueries({ queryKey: ["dns-runtime-logs"] });
-    queryClient.invalidateQueries({ queryKey: ["dns-runtime-events"] });
-  };
   const refreshAll = () => {
     refreshDashboard();
-    refreshRuntime();
+    queryClient.invalidateQueries({ queryKey: ["dns-bootstrap"] });
+    queryClient.invalidateQueries({ queryKey: ["network-interfaces-bootstrap"] });
   };
 
   const { data, isLoading } = useQuery({
     queryKey: ["dns-dashboard"],
     queryFn: () => api<Dashboard>("/api/dns/dashboard")
   });
-
-  const runtimeStatus = useQuery({
-    queryKey: ["dns-runtime-status"],
-    queryFn: () => api<RuntimeStatus>("/api/dns/runtime/status"),
-    refetchInterval: activeTab === "runtime" ? 3000 : false,
-    enabled: Boolean(data?.bootstrapCompleted)
+  const bootstrapState = useQuery({
+    queryKey: ["dns-bootstrap"],
+    queryFn: () => api<BootstrapState>("/api/dns/bootstrap")
+  });
+  const networkInterfaces = useQuery({
+    queryKey: ["network-interfaces-bootstrap"],
+    queryFn: () => api<NetworkInterfacesState>("/api/network-interfaces")
   });
 
-  const runtimeMetrics = useQuery({
-    queryKey: ["dns-runtime-metrics"],
-    queryFn: () => api<RuntimeMetrics>("/api/dns/runtime/metrics"),
-    refetchInterval: activeTab === "runtime" ? 4000 : false,
-    enabled: Boolean(data?.bootstrapCompleted)
-  });
-
-  const runtimeLogs = useQuery({
-    queryKey: ["dns-runtime-logs"],
-    queryFn: () => api<RuntimeLog[]>("/api/dns/runtime/logs?limit=20"),
-    refetchInterval: activeTab === "runtime" ? 4000 : false,
-    enabled: Boolean(data?.bootstrapCompleted)
-  });
-
-  const runtimeEvents = useQuery({
-    queryKey: ["dns-runtime-events"],
-    queryFn: () => api<EventItem[]>("/api/dns/events?limit=20"),
-    refetchInterval: activeTab === "runtime" ? 5000 : false,
-    enabled: Boolean(data?.bootstrapCompleted)
-  });
-
-  const bootstrapMutation = useMutation({
+  const bootstrapSettingsMutation = useMutation({
     mutationFn: (payload: BootstrapForm) =>
-      api("/api/dns/bootstrap", { method: "POST", body: JSON.stringify(payload) }),
+      api("/api/dns/bootstrap/settings", { method: "POST", body: JSON.stringify(payload) }),
+    onSuccess: refreshAll
+  });
+  const bootstrapCaMutation = useMutation({
+    mutationFn: (payload: BootstrapCaForm) =>
+      api("/api/dns/bootstrap/ca", { method: "POST", body: JSON.stringify(normalizeBootstrapCaForm(payload)) }),
+    onSuccess: refreshAll
+  });
+  const bootstrapInterfacesMutation = useMutation({
+    mutationFn: (payload: NetworkInterfaceConfig[]) =>
+      api("/api/network-interfaces", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: refreshAll
   });
 
@@ -320,8 +304,6 @@ export function DnsPage() {
     blocklistDeleteMutation.error
   ]);
 
-  const runtimeErrorEvents = (runtimeEvents.data ?? []).filter((event) => event.topic.startsWith("dns.runtime."));
-
   if (isLoading || !data) {
     return (
       <AppShell title="DNS" description="Authoritative zones, recursive upstreams and resolver policy for the LAN.">
@@ -340,28 +322,21 @@ export function DnsPage() {
         actions={
           <>
             <Tabs value={activeTab} onValueChange={setActiveTab} tabs={dnsTabs} />
-            {activeTab === "runtime" ? (
-              <Button variant="secondary" onClick={refreshRuntime}>
-                <RefreshCcw className="h-4 w-4" />
-                Refresh runtime
-              </Button>
-            ) : (
-              <CreateDialog
-                activeTab={activeTab}
-                zones={data.zones}
-                onCreateZone={(values) => zoneCreateMutation.mutate(values)}
-                onCreateRecord={(values) => recordCreateMutation.mutate(values)}
-                onCreateUpstream={(values) => upstreamCreateMutation.mutate(values)}
-                onCreateBlocklist={(values) => blocklistCreateMutation.mutate(values)}
-                loadingMap={{
-                  zones: zoneCreateMutation.isPending,
-                  records: recordCreateMutation.isPending,
-                  upstreams: upstreamCreateMutation.isPending,
-                  blocklist: blocklistCreateMutation.isPending
-                }}
-                error={dialogError}
-              />
-            )}
+            <CreateDialog
+              activeTab={activeTab}
+              zones={data.zones}
+              onCreateZone={(values) => zoneCreateMutation.mutate(values)}
+              onCreateRecord={(values) => recordCreateMutation.mutate(values)}
+              onCreateUpstream={(values) => upstreamCreateMutation.mutate(values)}
+              onCreateBlocklist={(values) => blocklistCreateMutation.mutate(values)}
+              loadingMap={{
+                zones: zoneCreateMutation.isPending,
+                records: recordCreateMutation.isPending,
+                upstreams: upstreamCreateMutation.isPending,
+                blocklist: blocklistCreateMutation.isPending
+              }}
+              error={dialogError}
+            />
           </>
         }
       >
@@ -421,21 +396,21 @@ export function DnsPage() {
           </InventoryCard>
         ) : null}
 
-        {activeTab === "runtime" ? (
-          <RuntimePanel
-            status={runtimeStatus.data}
-            metrics={runtimeMetrics.data}
-            logs={runtimeLogs.data ?? []}
-            events={runtimeErrorEvents}
-          />
-        ) : null}
       </AppShell>
 
       {!data.bootstrapCompleted ? (
         <BootstrapOverlay
-          loading={bootstrapMutation.isPending}
-          onSubmit={(values) => bootstrapMutation.mutate(values)}
-          error={bootstrapMutation.error instanceof Error ? bootstrapMutation.error.message : null}
+          bootstrap={bootstrapState.data}
+          networkInterfaces={networkInterfaces.data}
+          dnsLoading={bootstrapSettingsMutation.isPending}
+          caLoading={bootstrapCaMutation.isPending}
+          interfacesLoading={bootstrapInterfacesMutation.isPending}
+          onSubmitDns={(values) => bootstrapSettingsMutation.mutate(values)}
+          onSubmitCa={(values) => bootstrapCaMutation.mutate(values)}
+          onSubmitInterfaces={(values) => bootstrapInterfacesMutation.mutate(values)}
+          dnsError={bootstrapSettingsMutation.error instanceof Error ? bootstrapSettingsMutation.error.message : null}
+          caError={bootstrapCaMutation.error instanceof Error ? bootstrapCaMutation.error.message : null}
+          interfacesError={bootstrapInterfacesMutation.error instanceof Error ? bootstrapInterfacesMutation.error.message : null}
         />
       ) : null}
     </>
@@ -461,6 +436,19 @@ function normalizeBlocklistForm(payload: BlocklistForm) {
   return {
     ...payload,
     source: payload.source || null
+  };
+}
+
+function normalizeBootstrapCaForm(payload: BootstrapCaForm) {
+  return {
+    ...payload,
+    organization: payload.organization.trim() || null,
+    organizationalUnit: payload.organizationalUnit.trim() || null,
+    country: payload.country.trim() || null,
+    state: payload.state.trim() || null,
+    locality: payload.locality.trim() || null,
+    emailAddress: payload.emailAddress.trim() || null,
+    pathLength: payload.pathLength == null || Number.isNaN(payload.pathLength) ? null : payload.pathLength
   };
 }
 
@@ -541,15 +529,31 @@ function CreateDialog({
 }
 
 function BootstrapOverlay({
-  onSubmit,
-  loading,
-  error
+  bootstrap,
+  networkInterfaces,
+  onSubmitDns,
+  onSubmitCa,
+  onSubmitInterfaces,
+  dnsLoading,
+  caLoading,
+  interfacesLoading,
+  dnsError,
+  caError,
+  interfacesError
 }: {
-  onSubmit: (values: BootstrapForm) => void;
-  loading: boolean;
-  error: string | null;
+  bootstrap?: BootstrapState;
+  networkInterfaces?: NetworkInterfacesState;
+  onSubmitDns: (values: BootstrapForm) => void;
+  onSubmitCa: (values: BootstrapCaForm) => void;
+  onSubmitInterfaces: (values: NetworkInterfaceConfig[]) => void;
+  dnsLoading: boolean;
+  caLoading: boolean;
+  interfacesLoading: boolean;
+  dnsError: string | null;
+  caError: string | null;
+  interfacesError: string | null;
 }) {
-  const { register, handleSubmit, watch, setValue } = useForm<BootstrapForm>({
+  const dnsForm = useForm<BootstrapForm>({
     defaultValues: {
       organizationName: "Aegis Corp",
       primaryContactEmail: "dns@azienda.local",
@@ -559,134 +563,201 @@ function BootstrapOverlay({
       blocklistEnabled: true
     }
   });
+  const caForm = useForm<BootstrapCaForm>({
+    defaultValues: {
+      name: "Aegis Root CA",
+      commonName: "Aegis Root CA",
+      organization: bootstrap?.settings?.organizationName ?? "Aegis Corp",
+      organizationalUnit: "Infrastructure",
+      country: "IT",
+      state: "",
+      locality: "",
+      emailAddress: bootstrap?.settings?.primaryContactEmail ?? "pki@azienda.local",
+      validityDays: 3650,
+      pathLength: 1
+    }
+  });
+  const [selectedInterfaces, setSelectedInterfaces] = useState<NetworkInterfaceConfig[]>([]);
+
+  useEffect(() => {
+    if (!networkInterfaces) {
+      return;
+    }
+    if (networkInterfaces.interfaces.length > 0) {
+      setSelectedInterfaces(networkInterfaces.interfaces);
+      return;
+    }
+    const defaults = networkInterfaces.availableInterfaces.map((entry, index) => ({
+      ...entry,
+      enabled: index === 0,
+      isDefault: index === 0
+    }));
+    setSelectedInterfaces(defaults);
+  }, [networkInterfaces]);
+
+  const currentStep = !bootstrap?.steps.dnsConfigured
+    ? "dns"
+    : !bootstrap?.steps.primaryCaConfigured
+      ? "ca"
+      : !bootstrap?.steps.interfacesConfigured
+        ? "interfaces"
+        : "done";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[rgba(3,8,15,0.78)] p-6 backdrop-blur-sm">
-      <Card className="w-full max-w-3xl border-primary/25 bg-card/95">
+      <Card className="w-full max-w-4xl border-primary/25 bg-card/95">
         <CardHeader>
           <div className="mb-3 inline-flex w-fit items-center gap-2 rounded-full border border-primary/25 bg-primary/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-primary">
             Initial Bootstrap
           </div>
-          <CardTitle>Configure the DNS service before opening the console</CardTitle>
-          <CardDescription>This first-run step creates the resolver profile and the initial primary local zone.</CardDescription>
+          <CardTitle>Complete DNS, PKI and network bootstrap</CardTitle>
+          <CardDescription>Finish the three required steps before publishing services: resolver config, root CA and machine interfaces.</CardDescription>
         </CardHeader>
-        <CardContent>
-          <form className="grid gap-4 md:grid-cols-2" onSubmit={handleSubmit(onSubmit)}>
-            <Field label="Organization">
-              <Input {...register("organizationName")} />
-            </Field>
-            <Field label="Primary contact">
-              <Input type="email" {...register("primaryContactEmail")} />
-            </Field>
-            <Field label="Default zone suffix">
-              <Input {...register("defaultZoneSuffix")} />
-            </Field>
-            <Field label="DNS port">
-              <Input type="number" {...register("dnsListenPort", { valueAsNumber: true })} />
-            </Field>
-            <Field label="Upstream mode">
-              <Select value={watch("upstreamMode")} onValueChange={(value: BootstrapForm["upstreamMode"]) => setValue("upstreamMode", value)}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="redundant">Redundant</SelectItem>
-                  <SelectItem value="strict">Strict chain</SelectItem>
-                </SelectContent>
-              </Select>
-            </Field>
-            <Field label="Blocklist">
-              <div className="flex h-10 items-center justify-between rounded-md border border-input bg-secondary/60 px-3">
-                <span className="text-sm text-muted-foreground">Enable filtering</span>
-                <Switch checked={watch("blocklistEnabled")} onCheckedChange={(value) => setValue("blocklistEnabled", value)} />
+        <CardContent className="space-y-6">
+          <div className="grid gap-4 md:grid-cols-3">
+            <BootstrapStep title="1. DNS" done={bootstrap?.steps.dnsConfigured ?? false} />
+            <BootstrapStep title="2. Root CA" done={bootstrap?.steps.primaryCaConfigured ?? false} />
+            <BootstrapStep title="3. Interfaces" done={bootstrap?.steps.interfacesConfigured ?? false} />
+          </div>
+
+          {currentStep === "dns" ? (
+            <form className="grid gap-4 rounded-lg border border-border p-4 md:grid-cols-2" onSubmit={dnsForm.handleSubmit(onSubmitDns)}>
+              <Field label="Organization">
+                <Input {...dnsForm.register("organizationName")} />
+              </Field>
+              <Field label="Primary contact">
+                <Input type="email" {...dnsForm.register("primaryContactEmail")} />
+              </Field>
+              <Field label="Default zone suffix">
+                <Input {...dnsForm.register("defaultZoneSuffix")} />
+              </Field>
+              <Field label="DNS port">
+                <Input type="number" {...dnsForm.register("dnsListenPort", { valueAsNumber: true })} />
+              </Field>
+              <Field label="Upstream mode">
+                <Select value={dnsForm.watch("upstreamMode")} onValueChange={(value: BootstrapForm["upstreamMode"]) => dnsForm.setValue("upstreamMode", value)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="redundant">Redundant</SelectItem>
+                    <SelectItem value="strict">Strict chain</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="Blocklist">
+                <div className="flex h-10 items-center justify-between rounded-md border border-input bg-secondary/60 px-3">
+                  <span className="text-sm text-muted-foreground">Enable filtering</span>
+                  <Switch checked={dnsForm.watch("blocklistEnabled")} onCheckedChange={(value) => dnsForm.setValue("blocklistEnabled", value)} />
+                </div>
+              </Field>
+              {dnsError ? <p className="md:col-span-2 text-sm text-destructive">{dnsError}</p> : null}
+              <div className="md:col-span-2 flex justify-end">
+                <Button type="submit" disabled={dnsLoading}>
+                  Save DNS settings
+                </Button>
               </div>
-            </Field>
-            {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
-            <div className="md:col-span-2 flex justify-end">
-              <Button type="submit" disabled={loading}>
-                <ShieldAlert className="h-4 w-4" />
-                Complete bootstrap
-              </Button>
+            </form>
+          ) : null}
+
+          {currentStep === "ca" ? (
+            <form className="grid gap-4 rounded-lg border border-border p-4 md:grid-cols-2" onSubmit={caForm.handleSubmit(onSubmitCa)}>
+              <Field label="CA name">
+                <Input {...caForm.register("name")} />
+              </Field>
+              <Field label="Common name">
+                <Input {...caForm.register("commonName")} />
+              </Field>
+              <Field label="Organization">
+                <Input {...caForm.register("organization")} />
+              </Field>
+              <Field label="Email">
+                <Input type="email" {...caForm.register("emailAddress")} />
+              </Field>
+              <Field label="Validity days">
+                <Input type="number" {...caForm.register("validityDays", { valueAsNumber: true })} />
+              </Field>
+              <Field label="Path length">
+                <Input type="number" {...caForm.register("pathLength", { valueAsNumber: true })} />
+              </Field>
+              {caError ? <p className="md:col-span-2 text-sm text-destructive">{caError}</p> : null}
+              <div className="md:col-span-2 flex justify-end">
+                <Button type="submit" disabled={caLoading}>
+                  Create root CA
+                </Button>
+              </div>
+            </form>
+          ) : null}
+
+          {currentStep === "interfaces" ? (
+            <div className="space-y-3 rounded-lg border border-border p-4">
+              {(selectedInterfaces.length > 0 ? selectedInterfaces : networkInterfaces?.availableInterfaces ?? []).map((entry, index) => (
+                <div key={`${entry.name}-${entry.address}`} className="grid gap-3 rounded-md border border-border/70 p-3 md:grid-cols-[1.2fr_1.2fr_1fr_auto_auto] md:items-center">
+                  <div>
+                    <Label className="mb-2 block text-xs text-muted-foreground">Name</Label>
+                    <Input
+                      value={selectedInterfaces[index]?.name ?? entry.name}
+                      onChange={(event) =>
+                        setSelectedInterfaces((current) =>
+                          current.map((item, itemIndex) => (itemIndex === index ? { ...item, name: event.target.value } : item))
+                        )
+                      }
+                    />
+                  </div>
+                  <div>
+                    <Label className="mb-2 block text-xs text-muted-foreground">Address</Label>
+                    <p className="text-sm">{entry.address}</p>
+                    <p className="text-xs text-muted-foreground">{entry.family.toUpperCase()}</p>
+                  </div>
+                  <div className="text-xs text-muted-foreground">{entry.isDefault ? "Default interface" : "Available interface"}</div>
+                  <div className="flex items-center gap-2">
+                    <Switch
+                      checked={selectedInterfaces[index]?.enabled ?? false}
+                      onCheckedChange={(value) =>
+                        setSelectedInterfaces((current) =>
+                          current.map((item, itemIndex) => (itemIndex === index ? { ...item, enabled: value, isDefault: value ? item.isDefault : false } : item))
+                        )
+                      }
+                    />
+                    <span className="text-sm">Enabled</span>
+                  </div>
+                  <Button
+                    type="button"
+                    variant={selectedInterfaces[index]?.isDefault ? "default" : "secondary"}
+                    onClick={() =>
+                      setSelectedInterfaces((current) =>
+                        current.map((item, itemIndex) => ({
+                          ...item,
+                          isDefault: itemIndex === index
+                        }))
+                      )
+                    }
+                  >
+                    Default
+                  </Button>
+                </div>
+              ))}
+              {interfacesError ? <p className="text-sm text-destructive">{interfacesError}</p> : null}
+              <div className="flex justify-end">
+                <Button type="button" disabled={interfacesLoading} onClick={() => onSubmitInterfaces(selectedInterfaces)}>
+                  Save interfaces
+                </Button>
+              </div>
             </div>
-          </form>
+          ) : null}
         </CardContent>
       </Card>
     </div>
   );
 }
 
-function RuntimePanel({
-  status,
-  metrics,
-  logs,
-  events
-}: {
-  status?: RuntimeStatus;
-  metrics?: RuntimeMetrics;
-  logs: RuntimeLog[];
-  events: EventItem[];
-}) {
+function BootstrapStep({ title, done }: { title: string; done: boolean }) {
   return (
-    <div className="space-y-6">
-      <div className="grid gap-4 xl:grid-cols-4">
-        <MetricCard icon={Activity} label="Runtime state" valueLabel={status?.state ?? "loading"} detail={status?.listening.udpPort ? `udp ${status.listening.udpPort}` : "not bound"} />
-        <MetricCard icon={ServerCog} label="Total queries" value={metrics?.totalQueries ?? 0} detail={`${metrics?.authoritativeQueries ?? 0} authoritative`} />
-        <MetricCard icon={Network} label="Upstream traffic" value={metrics?.upstreamQueries ?? 0} detail={`${metrics?.avgDurationMs?.toFixed(1) ?? "0.0"} ms avg`} />
-        <MetricCard icon={Ban} label="Denied" value={metrics?.blockedQueries ?? 0} detail={`${metrics?.servfailQueries ?? 0} servfail`} />
+    <div className={`rounded-lg border px-4 py-3 ${done ? "border-emerald-500/20 bg-emerald-500/5" : "border-border bg-background/30"}`}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-medium">{title}</p>
+        <Badge variant={done ? "success" : "muted"} dot>{done ? "Done" : "Pending"}</Badge>
       </div>
-
-      <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
-        <Card className="bg-background/20">
-          <CardHeader>
-            <CardTitle>Runtime status</CardTitle>
-            <CardDescription>Worker supervision, bind state and heartbeat.</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-2">
-            <StatusRow label="State" value={status?.state ?? "loading"} />
-            <StatusRow label="PID" value={status?.pid == null ? "n/a" : String(status.pid)} />
-            <StatusRow label="Restarts" value={String(status?.restarts ?? 0)} />
-            <StatusRow label="Address" value={status?.listening.address ?? "n/a"} />
-            <StatusRow label="UDP port" value={status?.listening.udpPort == null ? "n/a" : String(status.listening.udpPort)} />
-            <StatusRow label="Last heartbeat" value={formatTimestamp(status?.lastHeartbeatAt)} />
-            <StatusRow label="Last start" value={formatTimestamp(status?.lastStartedAt)} />
-            <StatusRow label="Last error" value={status?.lastError ?? "none"} />
-          </CardContent>
-        </Card>
-
-        <Card className="bg-background/20">
-          <CardHeader>
-            <CardTitle>Recent runtime events</CardTitle>
-            <CardDescription>Restart, bind and error lifecycle from the DNS worker manager.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <SimpleTable
-              headers={["Time", "Topic", "Payload"]}
-              rows={events.slice(0, 8).map((event) => [formatTimestamp(event.createdAt), event.topic, safeCompactJson(event.payload)])}
-            />
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card className="bg-background/20">
-        <CardHeader>
-          <CardTitle>Live query log</CardTitle>
-          <CardDescription>Recent DNS requests captured by the runtime.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <SimpleTable
-            headers={["Time", "Name", "Type", "Mode", "Code", "Client", "Latency"]}
-            rows={logs.map((log) => [
-              formatTimestamp(log.createdAt),
-              log.questionName,
-              log.questionType,
-              log.resolutionMode,
-              log.responseCode,
-              log.clientIp ?? "n/a",
-              `${log.durationMs} ms`
-            ])}
-          />
-        </CardContent>
-      </Card>
     </div>
   );
 }
@@ -709,9 +780,9 @@ function ZonesTable({
       headers={["Zone", "Type", "TTL", "State", "Actions"]}
       rows={zones.map((zone) => [
         zone.name,
-        zone.kind,
+        <Badge key="kind" variant={zone.kind === "local" ? "default" : "muted"}>{zone.kind === "local" ? "Local" : "Forward"}</Badge>,
         `${zone.ttl}s`,
-        zone.enabled ? "Enabled" : "Disabled",
+        <Badge key="state" variant={zone.enabled ? "success" : "muted"} dot>{zone.enabled ? "Active" : "Disabled"}</Badge>,
         <RowActions
           key={zone.id}
           editTitle="Edit zone"
@@ -750,35 +821,91 @@ function RecordsTable({
   loading: boolean;
   error: string | null;
 }) {
-  return (
-    <EntityTable
-      headers={["FQDN", "Type", "Value", "Service", "Actions"]}
-      rows={records.map((record) => [
-        `${record.name}.${record.zoneName}`,
-        record.type,
-        record.value,
-        record.proxiedService ?? "Unlinked",
-        <RowActions
-          key={record.id}
-          editTitle="Edit record"
-          deleteTitle="Delete record"
-          deleteDescription={`This will remove ${record.name}.${record.zoneName}.`}
+  const managed = records.filter((r) => r.proxiedService !== null);
+  const custom = records.filter((r) => r.proxiedService === null);
+
+  const recordCells = (record: RecordItem) => [
+    <span key="fqdn" className="font-mono text-xs">{record.name}.{record.zoneName}</span>,
+    <Badge key="type" variant={record.type === "A" || record.type === "AAAA" ? "default" : record.type === "CNAME" ? "warning" : "muted"}>{record.type}</Badge>,
+    <span key="val" className="font-mono text-xs">{record.value}</span>,
+    <Badge key="svc" variant="default">{record.proxiedService}</Badge>
+  ];
+
+  const managedRow = (record: RecordItem) => [
+    ...recordCells(record),
+    <div key="lock" className="flex justify-end">
+      <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/60">
+        <Lock className="h-3 w-3" />
+        Managed
+      </span>
+    </div>
+  ];
+
+  const customRow = (record: RecordItem) => [
+    ...recordCells(record).slice(0, 3),
+    record.proxiedService
+      ? <Badge key="svc" variant="default">{record.proxiedService}</Badge>
+      : <span key="unlinked" className="text-muted-foreground">—</span>,
+    <RowActions
+      key={record.id}
+      editTitle="Edit record"
+      deleteTitle="Delete record"
+      deleteDescription={`This will remove ${record.name}.${record.zoneName}.`}
+      loading={loading}
+      error={error}
+      editContent={
+        <RecordFormDialog
           loading={loading}
+          zones={zones}
           error={error}
-          editContent={
-            <RecordFormDialog
-              loading={loading}
-              zones={zones}
-              error={error}
-              initialValues={recordToForm(record)}
-              submitLabel="Save changes"
-              onSubmit={(values) => onUpdate(record.id, values)}
-            />
-          }
-          onDelete={() => onDelete(record.id)}
+          initialValues={recordToForm(record)}
+          submitLabel="Save changes"
+          onSubmit={(values) => onUpdate(record.id, values)}
         />
-      ])}
+      }
+      onDelete={() => onDelete(record.id)}
     />
+  ];
+
+  return (
+    <div className="space-y-0 overflow-hidden rounded-md border border-border">
+      {/* Managed section */}
+      <div className="border-b border-border bg-primary/[0.03]">
+        <div className="flex items-center gap-2.5 border-b border-primary/10 bg-primary/5 px-4 py-2.5">
+          <Lock className="h-3.5 w-3.5 text-primary/60" />
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-primary/80">Managed</p>
+          <Badge variant="default">{managed.length}</Badge>
+          <p className="ml-1 text-xs text-muted-foreground">Auto-created by proxy routes and Docker automap — read-only</p>
+        </div>
+        <SimpleTable
+          headers={["FQDN", "Type", "Value", "Service", ""]}
+          rows={
+            managed.length > 0
+              ? managed.map(managedRow)
+              : [[<span key="empty" className="text-muted-foreground/60 text-xs italic">No managed records yet</span>, "", "", "", ""]]
+          }
+          alignLastRight
+        />
+      </div>
+
+      {/* Custom section */}
+      <div>
+        <div className="flex items-center gap-2.5 border-b border-border bg-secondary/30 px-4 py-2.5">
+          <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Custom</p>
+          <Badge variant="muted">{custom.length}</Badge>
+          <p className="ml-1 text-xs text-muted-foreground">Manually created records</p>
+        </div>
+        <SimpleTable
+          headers={["FQDN", "Type", "Value", "Service", "Actions"]}
+          rows={
+            custom.length > 0
+              ? custom.map(customRow)
+              : [[<span key="empty" className="text-muted-foreground/60 text-xs italic">No custom records yet</span>, "", "", "", ""]]
+          }
+          alignLastRight
+        />
+      </div>
+    </div>
   );
 }
 
@@ -800,9 +927,9 @@ function UpstreamsTable({
       headers={["Resolver", "Endpoint", "Protocol", "Health", "Actions"]}
       rows={upstreams.map((upstream) => [
         upstream.name,
-        `${upstream.address}:${upstream.port}`,
-        upstream.protocol.toUpperCase(),
-        upstream.healthStatus,
+        <span key="ep" className="font-mono text-xs">{upstream.address}:{upstream.port}</span>,
+        <Badge key="proto" variant="default">{upstream.protocol.toUpperCase()}</Badge>,
+        <Badge key="health" variant={upstream.healthStatus === "healthy" ? "success" : upstream.healthStatus === "degraded" ? "warning" : "muted"} dot>{upstream.healthStatus}</Badge>,
         <RowActions
           key={upstream.id}
           editTitle="Edit upstream"
@@ -843,10 +970,10 @@ function BlocklistTable({
     <EntityTable
       headers={["Pattern", "Kind", "Source", "State", "Actions"]}
       rows={entries.map((entry) => [
-        entry.pattern,
-        entry.kind,
+        <span key="pat" className="font-mono text-xs">{entry.pattern}</span>,
+        <Badge key="kind" variant="muted">{entry.kind}</Badge>,
         entry.source ?? "manual",
-        entry.enabled ? "Enabled" : "Disabled",
+        <Badge key="state" variant={entry.enabled ? "success" : "muted"} dot>{entry.enabled ? "Active" : "Disabled"}</Badge>,
         <RowActions
           key={entry.id}
           editTitle="Edit rule"
@@ -916,7 +1043,7 @@ function RowActions({
             <DialogDescription>{deleteDescription}</DialogDescription>
           </DialogHeader>
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
-          <DialogFooter>
+          <DialogFooter className="md:col-span-2 gap-2">
             <DialogClose asChild>
               <Button variant="secondary">Cancel</Button>
             </DialogClose>
@@ -1293,7 +1420,7 @@ function DialogForm({
       </DialogHeader>
       {children}
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
-      <DialogFooter>
+      <DialogFooter className="md:col-span-2 gap-2">
         <Button type="submit" disabled={loading}>
           <Plus className="h-4 w-4" />
           {submitLabel}
@@ -1371,31 +1498,6 @@ function SimpleTable({
       </table>
     </div>
   );
-}
-
-function StatusRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-border bg-secondary/25 px-3 py-3">
-      <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
-      <div className="mt-1 text-sm">{value}</div>
-    </div>
-  );
-}
-
-function formatTimestamp(value?: string | null) {
-  if (!value) {
-    return "n/a";
-  }
-  return new Date(value).toLocaleString();
-}
-
-function safeCompactJson(value: string) {
-  try {
-    const parsed = JSON.parse(value);
-    return JSON.stringify(parsed);
-  } catch {
-    return value;
-  }
 }
 
 function zoneToForm(zone: Zone): ZoneForm {
