@@ -1,7 +1,10 @@
 import { EventBus } from "../events/event-bus.js";
+import { generateCertificateAuthority } from "../lib/pki.js";
 import type { AuditAction, AuditContext, BootstrapSettings, DnsRuntimeStatus } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
 import type { NewBlocklistEntry } from "../repositories/blocklist-repository.js";
+import type { NewCertificateAuthority } from "../repositories/certificate-authority-repository.js";
+import type { NewCertificateSubject } from "../repositories/certificate-subject-repository.js";
 import type { NewRecord } from "../repositories/dns-record-repository.js";
 import type { NewUpstream } from "../repositories/dns-upstream-repository.js";
 import type { NewZone } from "../repositories/dns-zone-repository.js";
@@ -11,6 +14,19 @@ interface RuntimeControl {
   getStatus(): DnsRuntimeStatus;
 }
 
+export type BootstrapRootCaInput = {
+  name: string;
+  commonName: string;
+  organization: string | null;
+  organizationalUnit: string | null;
+  country: string | null;
+  state: string | null;
+  locality: string | null;
+  emailAddress: string | null;
+  validityDays: number;
+  pathLength: number | null;
+};
+
 export class DnsService {
   constructor(
     private readonly repositories: Repositories,
@@ -19,23 +35,41 @@ export class DnsService {
   ) {}
 
   async getBootstrap(context: AuditContext) {
-    const settings = await this.repositories.resolverSettings.get();
+    const [settings, certificateAuthority, interfaces] = await Promise.all([
+      this.repositories.resolverSettings.get(),
+      this.repositories.certificateAuthorities.getDefaultRoot(),
+      this.repositories.networkInterfaces.list()
+    ]);
+    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces);
     await this.audit("bootstrap.read", "resolver_settings", settings?.id, context, {
-      bootstrapCompleted: Boolean(settings)
+      ...steps
     });
     return {
-      bootstrapCompleted: Boolean(settings),
-      settings
+      bootstrapCompleted: steps.completed,
+      steps,
+      settings,
+      certificateAuthority: certificateAuthority
+        ? {
+            id: certificateAuthority.id,
+            name: certificateAuthority.name,
+            commonName: certificateAuthority.commonName,
+            expiresAt: certificateAuthority.expiresAt,
+            isDefault: certificateAuthority.isDefault
+          }
+        : null
     };
   }
 
   async completeBootstrap(input: BootstrapSettings, context: AuditContext) {
+    return this.saveBootstrapSettings(input, context);
+  }
+
+  async saveBootstrapSettings(input: BootstrapSettings, context: AuditContext) {
     const result = await this.repositories.db.transaction(async (trx) => {
       const scopedRepos = createRepositories(trx);
-      const scopedEvents = new EventBus(scopedRepos);
       const existing = await scopedRepos.resolverSettings.get();
       if (existing) {
-        throw new Error("Bootstrap already completed");
+        throw new Error("Bootstrap DNS settings already configured");
       }
 
       const settings = await scopedRepos.resolverSettings.create(input);
@@ -60,40 +94,104 @@ export class DnsService {
         context
       });
 
-      if (settings?.id) {
-        await scopedEvents.publish({
-          topic: "dns.bootstrap.completed",
-          aggregateType: "resolver_settings",
-          aggregateId: String(settings.id),
-          payload: {
-            organizationName: settings.organizationName,
-            defaultZoneSuffix: settings.defaultZoneSuffix,
-            zoneId: zone?.id ?? null
-          },
-          context
-        });
-      }
-
       return {
-        bootstrapCompleted: true,
-        settings
+        settings,
+        zone
       };
     });
     this.runtimeControl?.requestReload();
-    return result;
+    await this.publishBootstrapCompletedIfReady(context);
+    return {
+      bootstrapCompleted: false,
+      settings: result.settings
+    };
+  }
+
+  async createBootstrapRootCertificateAuthority(input: BootstrapRootCaInput, context: AuditContext) {
+    const authority = await this.repositories.db.transaction(async (trx) => {
+      const repos = createRepositories(trx);
+      const existingDefault = await repos.certificateAuthorities.getDefaultRoot();
+      if (existingDefault) {
+        throw new Error("Bootstrap root CA already configured");
+      }
+
+      const subject = await repos.certificateSubjects.create({
+        name: input.name.trim(),
+        parentSubjectId: null,
+        parentSubjectName: null,
+        commonName: input.commonName.trim(),
+        organization: nullable(input.organization),
+        organizationalUnit: nullable(input.organizationalUnit),
+        country: nullable(input.country),
+        state: nullable(input.state),
+        locality: nullable(input.locality),
+        emailAddress: nullable(input.emailAddress)
+      } satisfies NewCertificateSubject);
+
+      if (!subject) {
+        throw new Error("Failed to create bootstrap certificate subject");
+      }
+
+      const material = await generateCertificateAuthority({
+        subject,
+        validityDays: input.validityDays,
+        pathLength: input.pathLength,
+        issuer: null
+      });
+
+      const created = await repos.certificateAuthorities.create({
+        name: input.name.trim(),
+        subjectId: subject.id,
+        issuerCaId: null,
+        certificatePem: material.certificatePem,
+        privateKeyPem: material.privateKeyPem,
+        serialNumber: material.serialNumber,
+        issuedAt: material.issuedAt,
+        expiresAt: material.expiresAt,
+        validityDays: input.validityDays,
+        pathLength: input.pathLength,
+        isSelfSigned: true,
+        isDefault: true,
+        active: true
+      } satisfies NewCertificateAuthority);
+
+      if (!created) {
+        throw new Error("Failed to create bootstrap root CA");
+      }
+      await repos.certificateAuthorities.setDefaultRoot(created.id);
+      await repos.audit.create({
+        action: "bootstrap.update",
+        entityType: "certificate_authority",
+        entityId: String(created.id),
+        payload: {
+          name: created.name,
+          commonName: created.commonName,
+          expiresAt: created.expiresAt
+        },
+        context
+      });
+      return created;
+    });
+
+    await this.publishBootstrapCompletedIfReady(context);
+    return authority;
   }
 
   async getDashboard(context: AuditContext) {
-    const [settings, zones, records, upstreams, blocklist] = await Promise.all([
+    const [settings, zones, records, upstreams, blocklist, certificateAuthority, interfaces] = await Promise.all([
       this.repositories.resolverSettings.get(),
       this.repositories.zones.list(),
       this.repositories.records.list(),
       this.repositories.upstreams.list(),
-      this.repositories.blocklist.list()
+      this.repositories.blocklist.list(),
+      this.repositories.certificateAuthorities.getDefaultRoot(),
+      this.repositories.networkInterfaces.list()
     ]);
+    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces);
 
     const dashboard = {
-      bootstrapCompleted: Boolean(settings),
+      bootstrapCompleted: steps.completed,
+      bootstrapSteps: steps,
       settings,
       summary: {
         zones: zones.length,
@@ -543,4 +641,47 @@ export class DnsService {
       context
     });
   }
+
+  private async publishBootstrapCompletedIfReady(context: AuditContext) {
+    const [settings, authority, interfaces] = await Promise.all([
+      this.repositories.resolverSettings.get(),
+      this.repositories.certificateAuthorities.getDefaultRoot(),
+      this.repositories.networkInterfaces.list()
+    ]);
+    const steps = buildBootstrapStatus(settings, authority, interfaces);
+    if (!steps.completed || !settings?.id) {
+      return;
+    }
+    await this.eventBus.publish({
+      topic: "dns.bootstrap.completed",
+      aggregateType: "resolver_settings",
+      aggregateId: String(settings.id),
+      payload: {
+        organizationName: settings.organizationName,
+        defaultZoneSuffix: settings.defaultZoneSuffix,
+        defaultInterface: interfaces.find((entry) => entry.isDefault)?.address ?? null,
+        certificateAuthority: authority?.name ?? null
+      },
+      context
+    });
+  }
+}
+
+function buildBootstrapStatus(
+  settings: Awaited<ReturnType<Repositories["resolverSettings"]["get"]>>,
+  certificateAuthority: Awaited<ReturnType<Repositories["certificateAuthorities"]["getDefaultRoot"]>>,
+  interfaces: Awaited<ReturnType<Repositories["networkInterfaces"]["list"]>>
+) {
+  const steps = {
+    dnsConfigured: Boolean(settings),
+    primaryCaConfigured: Boolean(certificateAuthority),
+    interfacesConfigured: interfaces.some((entry) => entry.enabled) && interfaces.some((entry) => entry.enabled && entry.isDefault),
+    completed: false
+  };
+  steps.completed = steps.dnsConfigured && steps.primaryCaConfigured && steps.interfacesConfigured;
+  return steps;
+}
+
+function nullable(value: string | null) {
+  return value?.trim() ? value.trim() : null;
 }

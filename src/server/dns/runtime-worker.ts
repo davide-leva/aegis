@@ -3,6 +3,7 @@ import { parentPort, threadId } from "node:worker_threads";
 import DNS from "dns2";
 
 import { createDb } from "../db/client.js";
+import { createPrivilegedPortError, hasPrivilegedPortAccess, isPrivilegedPort, normalizePrivilegedBindError } from "../lib/privileged-ports.js";
 import { createRepositories } from "../repositories/index.js";
 import type { BlocklistEntry, DnsRecord, DnsRuntimeStatus, DnsUpstream, DnsZone } from "../types.js";
 
@@ -103,6 +104,12 @@ async function refreshSnapshot() {
   ]);
 
   const nextSnapshot = compileSnapshot(zones, records, upstreams, blocklist, settings.dnsListenPort);
+  if (isPrivilegedPort(nextSnapshot.listenPort) && !hasPrivilegedPortAccess()) {
+    throw createPrivilegedPortError([
+      { runtime: "dns", protocol: "udp", address: currentAddress, port: nextSnapshot.listenPort },
+      { runtime: "dns", protocol: "tcp", address: currentAddress, port: nextSnapshot.listenPort }
+    ]);
+  }
   const changed = !snapshot || snapshot.version !== nextSnapshot.version;
   const portChanged = currentPort !== nextSnapshot.listenPort;
   snapshot = nextSnapshot;
@@ -240,7 +247,11 @@ async function restartServer() {
       }
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown DNS runtime error";
+    const normalized = normalizePrivilegedBindError(error, [
+      { runtime: "dns", protocol: "udp", address: currentAddress, port: snapshot.listenPort },
+      { runtime: "dns", protocol: "tcp", address: currentAddress, port: snapshot.listenPort }
+    ]);
+    const message = normalized.message;
     updateStatus({
       state: "error",
       lastError: message,

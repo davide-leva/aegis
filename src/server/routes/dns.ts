@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import { sendValidationError } from "../lib/http.js";
 import { getAuditContext } from "../lib/request-context.js";
-import { DnsService } from "../services/dns-service.js";
+import { BootstrapRootCaInput, DnsService } from "../services/dns-service.js";
 
 const bootstrapSchema = z.object({
   organizationName: z.string().min(2),
@@ -12,6 +12,19 @@ const bootstrapSchema = z.object({
   upstreamMode: z.enum(["redundant", "strict"]),
   dnsListenPort: z.number().int().min(1).max(65535),
   blocklistEnabled: z.boolean()
+});
+
+const bootstrapCaSchema = z.object({
+  name: z.string().min(2).max(120),
+  commonName: z.string().min(2).max(255),
+  organization: z.string().max(255).nullable(),
+  organizationalUnit: z.string().max(255).nullable(),
+  country: z.string().length(2).nullable(),
+  state: z.string().max(255).nullable(),
+  locality: z.string().max(255).nullable(),
+  emailAddress: z.string().email().nullable(),
+  validityDays: z.number().int().min(30).max(3650),
+  pathLength: z.number().int().min(0).max(10).nullable()
 });
 
 const zoneSchema = z.object({
@@ -72,8 +85,36 @@ export function createDnsRouter(service: DnsService) {
       const result = await service.completeBootstrap(payload, getAuditContext(req));
       return res.status(201).json(result);
     } catch (error) {
-      if (error instanceof Error && error.message === "Bootstrap already completed") {
+      if (error instanceof Error && error.message === "Bootstrap DNS settings already configured") {
         return res.status(409).json({ error: error.message });
+      }
+      return sendValidationError(res, error);
+    }
+  });
+
+  router.post("/bootstrap/settings", async (req, res) => {
+    try {
+      const payload = bootstrapSchema.parse(req.body);
+      const result = await service.saveBootstrapSettings(payload, getAuditContext(req));
+      return res.status(201).json(result);
+    } catch (error) {
+      if (error instanceof Error && error.message === "Bootstrap DNS settings already configured") {
+        return res.status(409).json({ error: error.message });
+      }
+      if (error instanceof Error) {
+        return res.status(400).json({ error: error.message });
+      }
+      return sendValidationError(res, error);
+    }
+  });
+
+  router.post("/bootstrap/ca", async (req, res) => {
+    try {
+      const payload = bootstrapCaSchema.parse(req.body) as BootstrapRootCaInput;
+      res.status(201).json(await service.createBootstrapRootCertificateAuthority(payload, getAuditContext(req)));
+    } catch (error) {
+      if (error instanceof Error) {
+        return res.status(400).json({ error: error.message });
       }
       return sendValidationError(res, error);
     }
