@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, FileKey2, Pencil, Plus, RefreshCcw, RotateCw, ShieldCheck, Trash2 } from "lucide-react";
+import { Download, FileKey2, Lock, Pencil, Plus, RefreshCcw, RotateCw, ShieldCheck, Trash2 } from "lucide-react";
 
 import { AppShell } from "@/components/layout/app-shell";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -84,6 +85,7 @@ type CertificatesDashboard = {
   subjects: CertificateSubject[];
   certificateAuthorities: CertificateAuthority[];
   serverCertificates: ServerCertificate[];
+  managedServerCertificateIds: number[];
 };
 
 type SubjectForm = {
@@ -116,6 +118,11 @@ type ServerCertificateForm = {
   validityDays: number;
   renewalDays: number;
   active: boolean;
+};
+
+type SubjectTreeItem = {
+  subject: CertificateSubject;
+  depth: number;
 };
 
 const certificateTabs = [
@@ -200,6 +207,7 @@ export function CertificatesPage() {
   }
 
   const data = dashboard.data;
+  const orderedSubjects = orderSubjects(data.subjects);
 
   return (
     <AppShell
@@ -219,7 +227,7 @@ export function CertificatesPage() {
               submitLabel="Create subject"
               loading={createSubjectMutation.isPending}
               error={dialogError}
-              subjects={data.subjects}
+              subjects={orderedSubjects}
               onSubmit={(values) => createSubjectMutation.mutate(values)}
               trigger={
                 <Button>
@@ -234,7 +242,7 @@ export function CertificatesPage() {
               title="Create CA"
               description="Issue a self-signed root CA or an intermediate CA signed by an existing authority."
               submitLabel="Create CA"
-              subjects={data.subjects}
+              subjects={orderedSubjects}
               authorities={data.certificateAuthorities}
               loading={createCaMutation.isPending}
               error={dialogError}
@@ -252,7 +260,7 @@ export function CertificatesPage() {
               title="Issue certificate"
               description="Issue a TLS certificate from one of your certificate authorities."
               submitLabel="Issue certificate"
-              subjects={data.subjects}
+              subjects={orderedSubjects}
               authorities={data.certificateAuthorities}
               loading={createServerCertificateMutation.isPending}
               error={dialogError}
@@ -284,8 +292,8 @@ export function CertificatesPage() {
           <CardContent>
             <DataTable
               headers={["Name", "Parent", "Common name", "Organization", "Email", "Actions"]}
-              rows={data.subjects.map((subject) => [
-                subject.name,
+              rows={orderedSubjects.map(({ subject, depth }) => [
+                <SubjectTreeLabel key={subject.id} name={subject.name} depth={depth} />,
                 subject.parentSubjectName ?? "Root",
                 subject.commonName,
                 subject.organization ?? "n/a",
@@ -297,11 +305,11 @@ export function CertificatesPage() {
                     submitLabel="Save changes"
                     loading={updateSubjectMutation.isPending}
                     error={dialogError}
-                    subjects={data.subjects.filter((item) => item.id !== subject.id)}
+                    subjects={orderedSubjects.filter((item) => item.subject.id !== subject.id)}
                     initialValues={subjectToForm(subject)}
                     onSubmit={(values) => updateSubjectMutation.mutate({ id: subject.id, payload: values })}
                     trigger={
-                      <Button variant="ghost" size="icon">
+                      <Button variant="ghost" className="h-9 w-9 p-0">
                         <Pencil className="h-4 w-4" />
                       </Button>
                     }
@@ -333,9 +341,15 @@ export function CertificatesPage() {
               rows={data.certificateAuthorities.map((authority) => [
                 authority.name,
                 authority.commonName,
-                authority.issuerName ?? "Self-signed",
-                `${formatTimestamp(authority.issuedAt)} -> ${formatTimestamp(authority.expiresAt)}`,
-                authority.isDefault ? "Default root" : authority.active ? "Active" : "Disabled",
+                authority.issuerName
+                  ? <span key="issuer" className="text-sm">{authority.issuerName}</span>
+                  : <Badge key="issuer" variant="muted">Self-signed</Badge>,
+                <span key="validity" className="text-xs text-muted-foreground">{formatTimestamp(authority.issuedAt)} → {formatTimestamp(authority.expiresAt)}</span>,
+                authority.isDefault
+                  ? <Badge key="state" variant="success" dot>Default root</Badge>
+                  : authority.active
+                    ? <Badge key="state" variant="default" dot>Active</Badge>
+                    : <Badge key="state" variant="muted">Disabled</Badge>,
                 <div key={authority.id} className="flex justify-end gap-2">
                   <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/certificates/cas/${authority.id}/download/certificate`)} />
                   <DownloadButton label="Key" onClick={() => downloadPem(`/api/certificates/cas/${authority.id}/download/key`)} />
@@ -353,23 +367,11 @@ export function CertificatesPage() {
             <CardDescription>TLS certificates signed by your internal certificate authorities, with SAN coverage and managed renewal.</CardDescription>
           </CardHeader>
           <CardContent>
-            <DataTable
-              headers={["Name", "Common name", "SAN", "Issuer", "Validity", "Actions"]}
-              rows={data.serverCertificates.map((certificate) => [
-                certificate.name,
-                certificate.commonName,
-                certificate.subjectAltNames.join(", "),
-                certificate.caName,
-                `${formatTimestamp(certificate.issuedAt)} -> ${formatTimestamp(certificate.expiresAt)}`,
-                <div key={certificate.id} className="flex justify-end gap-2">
-                  <Button variant="ghost" size="icon" onClick={() => renewServerCertificateMutation.mutate(certificate.id)} disabled={renewServerCertificateMutation.isPending}>
-                    <RotateCw className="h-4 w-4" />
-                  </Button>
-                  <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/certificate`)} />
-                  <DownloadButton label="Chain" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/chain`)} />
-                  <DownloadButton label="Key" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/key`)} />
-                </div>
-              ])}
+            <ServerCertsTable
+              certificates={data.serverCertificates}
+              managedIds={data.managedServerCertificateIds}
+              renewLoading={renewServerCertificateMutation.isPending}
+              onRenew={(id) => renewServerCertificateMutation.mutate(id)}
             />
           </CardContent>
         </Card>
@@ -394,7 +396,7 @@ function SubjectDialog({
   submitLabel: string;
   loading: boolean;
   error: string | null;
-  subjects: CertificateSubject[];
+  subjects: SubjectTreeItem[];
   initialValues?: SubjectForm;
   onSubmit: (values: SubjectForm) => void;
   trigger: React.ReactNode;
@@ -444,9 +446,9 @@ function SubjectDialog({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="root">Root subject</SelectItem>
-                {subjects.map((subject) => (
+                {subjects.map(({ subject, depth }) => (
                   <SelectItem key={subject.id} value={String(subject.id)}>
-                    {subject.name}
+                    {formatSubjectOptionLabel(subject.name, depth)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -504,7 +506,7 @@ function CertificateAuthorityDialog({
   title: string;
   description: string;
   submitLabel: string;
-  subjects: CertificateSubject[];
+  subjects: SubjectTreeItem[];
   authorities: CertificateAuthority[];
   loading: boolean;
   error: string | null;
@@ -515,7 +517,7 @@ function CertificateAuthorityDialog({
   const { register, handleSubmit, watch, setValue } = useForm<CertificateAuthorityForm>({
     defaultValues: {
       name: "",
-      subjectId: subjects[0]?.id ?? 0,
+      subjectId: subjects[0]?.subject.id ?? 0,
       issuerCaId: null,
       validityDays: 1825,
       pathLength: 1,
@@ -550,9 +552,9 @@ function CertificateAuthorityDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {subjects.map((subject) => (
+                {subjects.map(({ subject, depth }) => (
                   <SelectItem key={subject.id} value={String(subject.id)}>
-                    {subject.name}
+                    {formatSubjectOptionLabel(subject.name, depth)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -600,7 +602,7 @@ function CertificateAuthorityDialog({
             </div>
           </Field>
           {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
-          <DialogFooter className="md:col-span-2">
+          <DialogFooter className="md:col-span-2 gap-2">
             <DialogClose asChild>
               <Button type="button" variant="secondary">
                 Cancel
@@ -630,7 +632,7 @@ function ServerCertificateDialog({
   title: string;
   description: string;
   submitLabel: string;
-  subjects: CertificateSubject[];
+  subjects: SubjectTreeItem[];
   authorities: CertificateAuthority[];
   loading: boolean;
   error: string | null;
@@ -641,7 +643,7 @@ function ServerCertificateDialog({
   const { register, handleSubmit, watch, setValue } = useForm<ServerCertificateForm>({
     defaultValues: {
       name: "",
-      subjectId: subjects[0]?.id ?? 0,
+      subjectId: subjects[0]?.subject.id ?? 0,
       caId: authorities[0]?.id ?? 0,
       subjectAltNames: "",
       validityDays: 397,
@@ -674,9 +676,9 @@ function ServerCertificateDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {subjects.map((subject) => (
+                {subjects.map(({ subject, depth }) => (
                   <SelectItem key={subject.id} value={String(subject.id)}>
-                    {subject.name}
+                    {formatSubjectOptionLabel(subject.name, depth)}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -716,7 +718,7 @@ function ServerCertificateDialog({
             />
           </Field>
           {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
-          <DialogFooter className="md:col-span-2">
+          <DialogFooter className="md:col-span-2 gap-2">
             <DialogClose asChild>
               <Button type="button" variant="secondary">
                 Cancel
@@ -732,9 +734,86 @@ function ServerCertificateDialog({
   );
 }
 
+function ServerCertsTable({
+  certificates,
+  managedIds,
+  renewLoading,
+  onRenew
+}: {
+  certificates: ServerCertificate[];
+  managedIds: number[];
+  renewLoading: boolean;
+  onRenew: (id: number) => void;
+}) {
+  const managedSet = new Set(managedIds);
+  const managed = certificates.filter((c) => managedSet.has(c.id));
+  const custom = certificates.filter((c) => !managedSet.has(c.id));
+  const headers = ["Name", "Common name", "SAN", "Issuer", "Validity", "Actions"];
+
+  const certCells = (certificate: ServerCertificate) => [
+    certificate.name,
+    certificate.commonName,
+    <span key="san" className="font-mono text-xs">{certificate.subjectAltNames.join(", ")}</span>,
+    certificate.caName,
+    <span key="validity" className="text-xs text-muted-foreground">{formatTimestamp(certificate.issuedAt)} → {formatTimestamp(certificate.expiresAt)}</span>,
+    <div key="actions" className="flex justify-end gap-2">
+      <Button variant="ghost" className="h-9 w-9 p-0" onClick={() => onRenew(certificate.id)} disabled={renewLoading}>
+        <RotateCw className="h-4 w-4" />
+      </Button>
+      <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/certificate`)} />
+      <DownloadButton label="Chain" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/chain`)} />
+      <DownloadButton label="Key" onClick={() => downloadPem(`/api/certificates/server-certificates/${certificate.id}/download/key`)} />
+    </div>
+  ];
+
+  const CertRow = ({ certificate, className }: { certificate: ServerCertificate; className?: string }) => (
+    <div className={`grid gap-3 border-t border-border px-4 py-4 text-sm text-foreground md:grid-cols-[repeat(auto-fit,minmax(0,1fr))] ${className ?? ""}`}>
+      {certCells(certificate).map((cell, cellIndex) => (
+        <div key={cellIndex} className={cellIndex === headers.length - 1 ? "md:text-right" : ""}>
+          <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground md:hidden">
+            {headers[cellIndex]}
+          </span>
+          {cell}
+        </div>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <div className="grid grid-cols-1">
+        <div className="hidden grid-cols-[repeat(auto-fit,minmax(0,1fr))] bg-secondary/60 px-4 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground md:grid">
+          {headers.map((h) => <div key={h}>{h}</div>)}
+        </div>
+        <div className="flex items-center gap-2.5 border-t border-border bg-primary/5 px-4 py-2.5">
+          <Lock className="h-3.5 w-3.5 text-primary/60" />
+          <span className="text-xs font-semibold uppercase tracking-[0.12em] text-primary/80">Managed</span>
+          <Badge variant="default">{managed.length}</Badge>
+          <span className="ml-1 text-xs text-muted-foreground">In use by proxy routes — read-only</span>
+        </div>
+        {managed.length === 0 ? (
+          <div className="border-t border-border bg-primary/[0.03] px-4 py-6 text-xs italic text-muted-foreground/60">No managed certificates yet</div>
+        ) : managed.map((certificate) => (
+          <CertRow key={certificate.id} certificate={certificate} className="bg-primary/[0.03]" />
+        ))}
+        <div className="flex items-center gap-2.5 border-t border-border bg-secondary/30 px-4 py-2.5">
+          <span className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Custom</span>
+          <Badge variant="muted">{custom.length}</Badge>
+          <span className="ml-1 text-xs text-muted-foreground">Manually created certificates</span>
+        </div>
+        {custom.length === 0 ? (
+          <div className="border-t border-border px-4 py-6 text-xs italic text-muted-foreground/60">No custom certificates yet</div>
+        ) : custom.map((certificate) => (
+          <CertRow key={certificate.id} certificate={certificate} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function DownloadButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
-    <Button variant="ghost" size="icon" title={label} onClick={onClick}>
+    <Button variant="ghost" className="h-9 w-9 p-0" title={label} onClick={onClick}>
       <Download className="h-4 w-4" />
     </Button>
   );
@@ -760,7 +839,7 @@ function DeleteDialog({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button variant="ghost" size="icon">
+        <Button variant="ghost" className="h-9 w-9 p-0">
           <Trash2 className="h-4 w-4" />
         </Button>
       </DialogTrigger>
@@ -770,7 +849,7 @@ function DeleteDialog({
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
         {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <DialogFooter>
+        <DialogFooter className="md:col-span-2 gap-2">
           <DialogClose asChild>
             <Button type="button" variant="secondary">
               Cancel
@@ -867,6 +946,44 @@ function Field({
       {children}
     </div>
   );
+}
+
+function SubjectTreeLabel({ name, depth }: { name: string; depth: number }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-muted-foreground" style={{ width: depth * 16 }} aria-hidden />
+      {depth > 0 ? <span className="text-muted-foreground">└</span> : null}
+      <span className={depth > 0 ? "font-medium text-foreground" : "font-semibold text-foreground"}>{name}</span>
+    </div>
+  );
+}
+
+function orderSubjects(subjects: CertificateSubject[]): SubjectTreeItem[] {
+  const byParent = new Map<number | null, CertificateSubject[]>();
+  for (const subject of subjects) {
+    const bucket = byParent.get(subject.parentSubjectId) ?? [];
+    bucket.push(subject);
+    byParent.set(subject.parentSubjectId, bucket);
+  }
+
+  for (const bucket of byParent.values()) {
+    bucket.sort((left, right) => left.name.localeCompare(right.name));
+  }
+
+  const ordered: SubjectTreeItem[] = [];
+  const visit = (parentId: number | null, depth: number) => {
+    for (const subject of byParent.get(parentId) ?? []) {
+      ordered.push({ subject, depth });
+      visit(subject.id, depth + 1);
+    }
+  };
+
+  visit(null, 0);
+  return ordered;
+}
+
+function formatSubjectOptionLabel(name: string, depth: number) {
+  return `${"\u00a0\u00a0".repeat(depth)}${depth > 0 ? "└ " : ""}${name}`;
 }
 
 function normalizeSubjectForm(payload: SubjectForm) {
