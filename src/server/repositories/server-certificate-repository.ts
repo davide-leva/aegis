@@ -141,6 +141,13 @@ export class ServerCertificateRepository {
     return this.getById(Number(id));
   }
 
+  async delete(id: number): Promise<void> {
+    await this.db.run(
+      `DELETE FROM server_certificates WHERE id = ${placeholder(1, this.db)}`,
+      [id]
+    );
+  }
+
   async updateMaterial(id: number, input: NewServerCertificate) {
     const now = new Date().toISOString();
     await this.db.run(

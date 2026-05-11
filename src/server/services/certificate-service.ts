@@ -45,10 +45,12 @@ export class CertificateService {
   ) {}
 
   async getDashboard(context: AuditContext) {
-    const [subjects, authorities, serverCertificates] = await Promise.all([
+    const [subjects, authorities, serverCertificates, managedRouteIds, proxyRoutes] = await Promise.all([
       this.repositories.certificateSubjects.list(),
       this.repositories.certificateAuthorities.list(),
-      this.repositories.serverCertificates.list()
+      this.repositories.serverCertificates.list(),
+      this.repositories.dockerPortMappings.listManagedProxyRouteIds(),
+      this.repositories.proxyRoutes.list()
     ]);
 
     const now = Date.now();
@@ -56,6 +58,16 @@ export class CertificateService {
       const diffDays = Math.ceil((new Date(certificate.expiresAt).getTime() - now) / 86400000);
       return diffDays <= certificate.renewalDays;
     }).length;
+
+    const managedRouteIdSet = new Set(managedRouteIds);
+    const managedTlsPems = new Set(
+      proxyRoutes
+        .filter((route) => managedRouteIdSet.has(route.id) && route.tlsCertPem)
+        .map((route) => route.tlsCertPem!)
+    );
+    const managedServerCertificateIds = serverCertificates
+      .filter((cert) => managedTlsPems.has(cert.certificatePem))
+      .map((cert) => cert.id);
 
     const dashboard = {
       summary: {
@@ -66,7 +78,8 @@ export class CertificateService {
       },
       subjects,
       certificateAuthorities: authorities,
-      serverCertificates
+      serverCertificates,
+      managedServerCertificateIds
     };
 
     await this.audit("certificate.dashboard.read", "certificate_dashboard", null, context, dashboard.summary);
