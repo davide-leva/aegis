@@ -1,6 +1,59 @@
 import type { DatabaseContext, DomainEvent, EventTopic } from "../types.js";
 import { placeholder, resolveInsertedId } from "./helpers.js";
 
+const ansi = {
+  reset: "\x1b[0m",
+  dim: "\x1b[2m",
+  cyan: "\x1b[36m",
+  magenta: "\x1b[35m",
+  yellow: "\x1b[33m",
+  green: "\x1b[32m",
+  gray: "\x1b[90m"
+} as const;
+
+function prettyFields(value: unknown, prefix = ""): string[] {
+  if (value == null) {
+    return [`${ansi.gray}${prefix || "value"}: null${ansi.reset}`];
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return [`${ansi.gray}${prefix || "items"}: none${ansi.reset}`];
+    }
+    return value.flatMap((entry, index) => prettyFields(entry, prefix ? `${prefix}[${index}]` : `[${index}]`));
+  }
+
+  if (typeof value === "object") {
+    const entries = Object.entries(value);
+    if (entries.length === 0) {
+      return [`${ansi.gray}${prefix || "value"}: empty${ansi.reset}`];
+    }
+    return entries.flatMap(([key, entry]) => prettyFields(entry, prefix ? `${prefix}.${key}` : key));
+  }
+
+  return [`${ansi.gray}${prefix || "value"}: ${String(value)}${ansi.reset}`];
+}
+
+function logDomainEvent(event: DomainEvent & Record<string, unknown>) {
+  const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+  const metadata =
+    typeof event.metadata === "string" ? JSON.parse(event.metadata) : (event.metadata ?? null);
+
+  process.stdout.write(
+    [
+      `${ansi.dim}${event.createdAt}${ansi.reset} ${ansi.cyan}DOMAIN_EVENT${ansi.reset} ${ansi.magenta}${event.topic}${ansi.reset}`,
+      `${ansi.yellow}${event.aggregateType}${ansi.reset}#${ansi.green}${event.aggregateId}${ansi.reset} ${ansi.dim}(id=${event.id})${ansi.reset}`,
+      `${ansi.dim}payload${ansi.reset}`,
+      ...prettyFields(payload),
+      metadata ? `${ansi.dim}metadata${ansi.reset}` : null,
+      ...(metadata ? prettyFields(metadata) : []),
+      ""
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+}
+
 export class EventRepository {
   constructor(private readonly db: DatabaseContext) {}
 
@@ -47,7 +100,7 @@ export class EventRepository {
       values
     );
     const id = await resolveInsertedId(this.db, result.lastInsertId);
-    return this.db.get<DomainEvent & Record<string, unknown>>(
+    const event = await this.db.get<DomainEvent & Record<string, unknown>>(
       `SELECT
         id,
         topic,
@@ -60,5 +113,9 @@ export class EventRepository {
       WHERE id = ${placeholder(1, this.db)}`,
       [id]
     );
+    if (event) {
+      logDomainEvent(event);
+    }
+    return event;
   }
 }
