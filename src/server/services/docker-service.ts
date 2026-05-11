@@ -1,6 +1,8 @@
 import { EventBus } from "../events/event-bus.js";
 import { generateServerCertificate } from "../lib/pki.js";
-import { inspectDockerContainer, listDockerContainers } from "../lib/docker-api.js";
+import { getCanonicalProxyListener } from "../lib/proxy-listeners.js";
+import { getEnvironmentResourceStats, inspectDockerContainer, listDockerContainers, watchDockerContainerEvents } from "../lib/docker-api.js";
+import type { DockerContainerEvent } from "../lib/docker-api.js";
 import type { AuditContext, DockerEnvironment as DockerEnvironmentEntity } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
 import type { NewCertificateSubject } from "../repositories/certificate-subject-repository.js";
@@ -27,6 +29,7 @@ export type CreateDockerPortMappingInput = {
   dnsName: string;
   routeName: string;
   routeProtocol: "http" | "https" | "tcp" | "udp";
+  networkInterfaceId: number | null;
   listenAddress: string;
   listenPort: number;
   sourcePath: string | null;
@@ -42,6 +45,7 @@ type AutomapCandidate = {
   protocol: "tcp" | "udp";
   publicPort: number | null;
   routeName: string;
+  networkInterfaceId: number | null;
   listenAddress: string;
   listenPort: number;
   sourcePath: string | null;
@@ -237,9 +241,10 @@ export class DockerService {
     const detail = await inspectDockerContainer(environment, containerId);
     await this.reconcileContainerAutomap(environment, detail, context);
     const mappings = await this.repositories.dockerPortMappings.listByEnvironment(environmentId);
+    const defaultInterface = await this.repositories.networkInterfaces.getDefault();
 
     const containerMappings = mappings.filter((mapping) => mapping.containerId === detail.id);
-    const automapAnalysis = analyzeAutomap(detail, containerMappings);
+    const automapAnalysis = analyzeAutomap(detail, containerMappings, defaultInterface);
     const enriched = {
       ...detail,
       mappings: containerMappings,
@@ -258,6 +263,13 @@ export class DockerService {
       exposedPorts: enriched.exposedPorts.length
     });
     return enriched;
+  }
+
+  async getEnvironmentResourceStats(environmentId: number) {
+    const environment = await this.requireEnvironment(environmentId);
+    const containers = await listDockerContainers(environment);
+    const runningIds = containers.filter((c) => c.state === "running").map((c) => c.id);
+    return getEnvironmentResourceStats(environment, runningIds);
   }
 
   async autoMapContainer(environmentId: number, containerId: string, context: AuditContext) {
@@ -279,6 +291,7 @@ export class DockerService {
       if (!settings) {
         throw new Error("DNS bootstrap is required before creating Docker mappings");
       }
+      const networkInterface = await resolveMappingInterface(repos, input.networkInterfaceId);
 
       const container = await inspectDockerContainer(environment, input.containerId);
       const target = resolveTarget(container, environment.publicIp, input.privatePort, input.publicPort, input.protocol);
@@ -339,10 +352,13 @@ export class DockerService {
       }
 
       const route = await repos.proxyRoutes.create({
+        ...normalizeDockerRouteListener(protocol, networkInterface.address, {
+          listenAddress: input.listenAddress.trim(),
+          listenPort: input.listenPort
+        }),
         name: input.routeName.trim(),
         protocol,
-        listenAddress: input.listenAddress.trim(),
-        listenPort: input.listenPort,
+        networkInterfaceId: networkInterface.id,
         sourceHost: protocol === "http" || protocol === "https" ? dnsName : null,
         sourcePath: protocol === "http" || protocol === "https" ? normalizePath(input.sourcePath) : null,
         targetHost: target.host,
@@ -459,7 +475,7 @@ export class DockerService {
   ) {
     const mappings = await this.repositories.dockerPortMappings.listByEnvironment(environment.id);
     const containerMappings = mappings.filter((mapping) => mapping.containerId === detail.id);
-    const analysis = analyzeAutomap(detail, containerMappings);
+    const analysis = analyzeAutomap(detail, containerMappings, await this.repositories.networkInterfaces.getDefault());
     const pending = analysis.candidates.filter((candidate) => !candidate.alreadyMapped);
 
     for (const issue of analysis.issues) {
@@ -489,6 +505,7 @@ export class DockerService {
             dnsName: candidate.dnsName,
             routeName: candidate.routeName,
             routeProtocol: candidate.routeProtocol,
+            networkInterfaceId: candidate.networkInterfaceId,
             listenAddress: candidate.listenAddress,
             listenPort: candidate.listenPort,
             sourcePath: candidate.sourcePath,
@@ -577,6 +594,173 @@ export class DockerService {
       )
       .slice(0, limit);
   }
+
+  // ─── Docker event watchers ─────────────────────────────────────────────────
+
+  private watchers = new Map<number, () => void>();
+
+  startWatching() {
+    void this.repositories.dockerEnvironments.list().then((environments) => {
+      for (const env of environments.filter((e) => e.enabled)) {
+        this.startEnvironmentWatcher(env);
+      }
+    });
+  }
+
+  stopWatching() {
+    for (const cleanup of this.watchers.values()) cleanup();
+    this.watchers.clear();
+  }
+
+  private startEnvironmentWatcher(environment: DockerEnvironmentEntity) {
+    this.watchers.get(environment.id)?.();
+
+    let retryDelay = 5000;
+    let retryTimer: NodeJS.Timeout | null = null;
+    let stopped = false;
+    let disconnectCleanup: (() => void) | null = null;
+
+    const connect = () => {
+      disconnectCleanup = watchDockerContainerEvents(
+        environment,
+        (event) => {
+          retryDelay = 5000;
+          void this.handleDockerEvent(environment, event);
+        },
+        (error) => {
+          if (stopped) return;
+          console.error(`[docker-watcher] env=${environment.id}: ${error.message}`);
+          retryTimer = setTimeout(() => { if (!stopped) connect(); }, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 60_000);
+        }
+      );
+    };
+
+    connect();
+
+    this.watchers.set(environment.id, () => {
+      stopped = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      disconnectCleanup?.();
+    });
+  }
+
+  private async handleDockerEvent(environment: DockerEnvironmentEntity, event: DockerContainerEvent) {
+    const context: AuditContext = {
+      actorType: "system",
+      actorId: "docker-watcher",
+      sourceIp: null,
+      userAgent: "aegis-docker-watcher"
+    };
+
+    if (event.action === "start" && hasAegisLabels(event.labels)) {
+      try {
+        await this.autoMapContainer(environment.id, event.containerId, context);
+      } catch (error) {
+        console.error(`[docker-watcher] automap failed for ${event.containerId}: ${error instanceof Error ? error.message : error}`);
+      }
+      return;
+    }
+
+    if (event.action === "destroy") {
+      try {
+        await this.releaseContainerMappings(event.containerId, context);
+      } catch (error) {
+        console.error(`[docker-watcher] cleanup failed for ${event.containerId}: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+  }
+
+  async releaseContainerMappings(containerId: string, context: AuditContext) {
+    const mappings = await this.repositories.dockerPortMappings.listByContainerId(containerId);
+    if (mappings.length === 0) return { released: 0 };
+
+    for (const mapping of mappings) {
+      await this.repositories.db.transaction(async (trx) => {
+        const repos = createRepositories(trx);
+        const events = new EventBus(repos);
+
+        const route = mapping.proxyRouteId ? await repos.proxyRoutes.getById(mapping.proxyRouteId) : null;
+        const dnsName = route?.sourceHost ?? null;
+
+        if (route) {
+          await repos.proxyRoutes.delete(route.id);
+          await repos.audit.create({
+            action: "proxy.route.delete",
+            entityType: "proxy_route",
+            entityId: String(route.id),
+            payload: route,
+            context
+          });
+          await events.publish({
+            topic: "proxy.route.deleted",
+            aggregateType: "proxy_route",
+            aggregateId: String(route.id),
+            payload: route,
+            context
+          });
+        }
+
+        if (dnsName) {
+          const remainingRoutes = (await repos.proxyRoutes.list()).filter((r) => r.sourceHost === dnsName);
+          if (remainingRoutes.length === 0) {
+            await tryDeleteManagedDnsRecord(repos, events, dnsName, context);
+          }
+        }
+
+        await repos.dockerPortMappings.deleteById(mapping.id);
+        await repos.audit.create({
+          action: "docker.mapping.delete",
+          entityType: "docker_mapping",
+          entityId: String(mapping.id),
+          payload: { mappingId: mapping.id, containerId, reason: "container_removed" },
+          context
+        });
+        await events.publish({
+          topic: "docker.mapping.deleted",
+          aggregateType: "docker_mapping",
+          aggregateId: String(mapping.id),
+          payload: { mappingId: mapping.id, containerId, reason: "container_removed" },
+          context
+        });
+      });
+    }
+
+    this.proxyRuntimeControl?.requestReload();
+    this.dnsRuntimeControl?.requestReload();
+    return { released: mappings.length };
+  }
+}
+
+async function tryDeleteManagedDnsRecord(
+  repos: Repositories,
+  events: EventBus,
+  dnsName: string,
+  context: AuditContext
+) {
+  const zones = await repos.zones.list();
+  const zone = pickZoneForHostname(dnsName, zones.map((z) => ({ id: z.id, name: z.name })));
+  if (!zone) return;
+  const recordName = toRecordName(dnsName, zone.name);
+  const record = (await repos.records.list()).find(
+    (r) => r.zoneId === zone.id && r.name === recordName && r.type === "A" && r.proxiedService !== null
+  );
+  if (!record) return;
+  await repos.records.delete(record.id);
+  await repos.audit.create({
+    action: "record.delete",
+    entityType: "dns_record",
+    entityId: String(record.id),
+    payload: record as unknown as Record<string, unknown>,
+    context
+  });
+  await events.publish({
+    topic: "dns.record.deleted",
+    aggregateType: "dns_record",
+    aggregateId: String(record.id),
+    payload: record as unknown as Record<string, unknown>,
+    context
+  });
 }
 
 function normalizeEnvironment(input: NewDockerEnvironment): NewDockerEnvironment {
@@ -716,7 +900,7 @@ async function ensureServerCertificateForHostname(
     parentSubjectName: parentSubject.name,
     commonName: input.dnsName,
     organization: parentSubject.organization,
-    organizationalUnit: "Docker Publishing",
+    organizationalUnit: "Aegis",
     country: parentSubject.country,
     state: parentSubject.state,
     locality: parentSubject.locality,
@@ -804,7 +988,8 @@ function analyzeAutomap(
     privatePort: number;
     protocol: "tcp" | "udp";
     proxyRouteName: string | null;
-  }>
+  }>,
+  defaultInterface: { id: number; address: string } | null
 ) {
   const labels = container.labels ?? {};
   const definitions = new Map<
@@ -858,6 +1043,17 @@ function analyzeAutomap(
         issues.push(resolveAutomapIssue(service, resolvedDefinition, exposedPorts));
         return [];
       }
+      if (!defaultInterface) {
+        issues.push({
+          service,
+          severity: "error",
+          code: "mapping_failed",
+          message: "No default network interface configured for automapping.",
+          labels: automapLabelRefs(service, []),
+          signature: `${service}:missing_default_interface`
+        });
+        return [];
+      }
 
       const routeProtocol = resolveAutomapRouteProtocol(service, resolvedDefinition, selectedPort, exposedPorts);
       const mappingProtocol = routeProtocol === "udp" ? "udp" : "tcp";
@@ -888,8 +1084,7 @@ function analyzeAutomap(
           protocol: selectedPort.protocol,
           publicPort: selectedPort.publishedBindings[0]?.publicPort ?? null,
           routeName,
-          listenAddress: "0.0.0.0",
-          listenPort: resolveAutomapListenPort(routeProtocol, selectedPort.privatePort),
+          ...resolveAutomapListener(routeProtocol, selectedPort.privatePort, defaultInterface.address, defaultInterface.id),
           sourcePath: routeProtocol === "http" || routeProtocol === "https" ? "/" : null,
           preserveHost: routeProtocol === "http" || routeProtocol === "https",
           enabled: true,
@@ -934,6 +1129,45 @@ function resolveAutomapPort(
   }
 
   return exposedPorts.length === 1 ? exposedPorts[0] : null;
+}
+
+async function resolveMappingInterface(repos: Repositories, networkInterfaceId: number | null) {
+  if (networkInterfaceId != null) {
+    const exact = await repos.networkInterfaces.getById(networkInterfaceId);
+    if (exact && exact.enabled) {
+      return exact;
+    }
+  }
+
+  const fallback = await repos.networkInterfaces.getDefault();
+  if (!fallback) {
+    throw new Error("Configure a default network interface before creating Docker mappings");
+  }
+  return fallback;
+}
+
+function normalizeDockerRouteListener(
+  protocol: NewProxyRoute["protocol"],
+  listenAddress: string,
+  listener: { listenAddress: string; listenPort: number }
+) {
+  const canonical = getCanonicalProxyListener(protocol, listenAddress);
+  return canonical ?? listener;
+}
+
+function resolveAutomapListener(routeProtocol: AutomapCandidate["routeProtocol"], privatePort: number, listenAddress: string, networkInterfaceId: number) {
+  const canonical = getCanonicalProxyListener(routeProtocol, listenAddress);
+  if (canonical) {
+    return {
+      networkInterfaceId,
+      ...canonical
+    };
+  }
+  return {
+    networkInterfaceId,
+    listenAddress,
+    listenPort: resolveAutomapListenPort(routeProtocol, privatePort)
+  };
 }
 
 function resolveAutomapRouteProtocol(

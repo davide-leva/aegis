@@ -72,6 +72,43 @@ export class DockerPortMappingRepository {
     return mapRows(rows) as unknown as DockerPortMapping[];
   }
 
+  async listByContainerId(containerId: string): Promise<DockerPortMapping[]> {
+    const rows = await this.db.all<Record<string, unknown>>(
+      `SELECT
+        mapping.id,
+        mapping.environment_id AS "environmentId",
+        mapping.container_id AS "containerId",
+        mapping.container_name AS "containerName",
+        mapping.private_port AS "privatePort",
+        mapping.public_port AS "publicPort",
+        mapping.protocol,
+        mapping.proxy_route_id AS "proxyRouteId",
+        route.name AS "proxyRouteName",
+        mapping.created_at AS "createdAt",
+        mapping.updated_at AS "updatedAt"
+      FROM docker_port_mappings mapping
+      LEFT JOIN proxy_routes route ON route.id = mapping.proxy_route_id
+      WHERE mapping.container_id = ${placeholder(1, this.db)}
+      ORDER BY mapping.private_port ASC`,
+      [containerId]
+    );
+    return mapRows(rows) as unknown as DockerPortMapping[];
+  }
+
+  async listManagedProxyRouteIds(): Promise<number[]> {
+    const rows = await this.db.all<Record<string, unknown>>(
+      `SELECT proxy_route_id AS "proxyRouteId" FROM docker_port_mappings WHERE proxy_route_id IS NOT NULL`
+    );
+    return rows.map((row) => Number(row["proxyRouteId"]));
+  }
+
+  async deleteById(id: number): Promise<void> {
+    await this.db.run(
+      `DELETE FROM docker_port_mappings WHERE id = ${placeholder(1, this.db)}`,
+      [id]
+    );
+  }
+
   async create(input: NewDockerPortMapping) {
     const now = new Date().toISOString();
     const values = [

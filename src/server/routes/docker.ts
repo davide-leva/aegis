@@ -35,6 +35,7 @@ const mappingSchema = z.object({
   dnsName: z.string().min(2).max(255),
   routeName: z.string().min(2).max(120),
   routeProtocol: z.enum(["http", "https", "tcp", "udp"]),
+  networkInterfaceId: z.number().int().positive().nullable(),
   listenAddress: z.string().min(2).max(255),
   listenPort: z.number().int().min(1).max(65535),
   sourcePath: z.string().max(255).nullable(),
@@ -91,6 +92,21 @@ export function createDockerRouter(service: DockerService) {
       }
       if (error instanceof Error) {
         return res.status(400).json({ error: error.message });
+      }
+      return sendValidationError(res, error);
+    }
+  });
+
+  router.get("/environments/:id/resource-stats", async (req, res) => {
+    try {
+      const { id } = idSchema.parse(req.params);
+      res.json(await service.getEnvironmentResourceStats(id));
+    } catch (error) {
+      if (error instanceof Error && error.message === "Docker environment not found") {
+        return res.status(404).json({ error: error.message });
+      }
+      if (error instanceof Error) {
+        return res.status(500).json({ error: error.message });
       }
       return sendValidationError(res, error);
     }

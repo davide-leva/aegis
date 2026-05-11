@@ -23,12 +23,21 @@ type DockerContainerSummary = {
 type DockerInspectContainer = {
   Id: string;
   Name: string;
+  RestartCount: number;
   Config: {
     Image: string;
     Env: string[] | null;
     ExposedPorts?: Record<string, Record<string, never>>;
     Labels?: Record<string, string>;
   };
+  HostConfig: {
+    RestartPolicy: {
+      Name: string;
+      MaximumRetryCount: number;
+    };
+    Memory: number;
+    NanoCpus: number;
+  } | null;
   State: {
     Status: string;
     Running: boolean;
@@ -65,8 +74,15 @@ export type ResolvedDockerContainer = {
 };
 
 export type ResolvedDockerContainerDetail = ResolvedDockerContainer & {
+  pid: number;
+  restartCount: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  restartPolicy: string;
+  memoryLimitBytes: number;
   labels: Record<string, string>;
   networkIps: string[];
+  networks: Array<{ name: string; ip: string }>;
   exposedPorts: Array<{
     privatePort: number;
     protocol: "tcp" | "udp";
@@ -76,6 +92,84 @@ export type ResolvedDockerContainerDetail = ResolvedDockerContainer & {
     }>;
   }>;
 };
+
+type DockerContainerStats = {
+  cpu_stats: {
+    cpu_usage: { total_usage: number; percpu_usage?: number[] };
+    system_cpu_usage: number;
+    online_cpus?: number;
+  };
+  precpu_stats: {
+    cpu_usage: { total_usage: number };
+    system_cpu_usage: number;
+  };
+  memory_stats: {
+    usage: number;
+    limit: number;
+    stats?: { cache?: number; inactive_file?: number };
+  };
+  networks?: Record<string, { rx_bytes: number; tx_bytes: number }>;
+};
+
+export type EnvironmentResourceStats = {
+  cpuPercent: number;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
+  networkRxBytes: number;
+  networkTxBytes: number;
+  sampledContainers: number;
+};
+
+export async function getEnvironmentResourceStats(
+  environment: DockerEnvironment,
+  containerIds: string[]
+): Promise<EnvironmentResourceStats> {
+  if (containerIds.length === 0) {
+    return { cpuPercent: 0, memoryUsedBytes: 0, memoryTotalBytes: 0, networkRxBytes: 0, networkTxBytes: 0, sampledContainers: 0 };
+  }
+
+  const results = await Promise.allSettled(
+    containerIds.map((id) =>
+      dockerRequest<DockerContainerStats>(environment, `/containers/${encodeURIComponent(id)}/stats?stream=false`)
+    )
+  );
+
+  let cpuTotal = 0;
+  let memUsed = 0;
+  let memTotal = 0;
+  let rxBytes = 0;
+  let txBytes = 0;
+  let count = 0;
+
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    const s = result.value;
+
+    const cpuDelta = (s.cpu_stats.cpu_usage.total_usage ?? 0) - (s.precpu_stats.cpu_usage.total_usage ?? 0);
+    const sysDelta = (s.cpu_stats.system_cpu_usage ?? 0) - (s.precpu_stats.system_cpu_usage ?? 0);
+    const numCpus = s.cpu_stats.online_cpus ?? s.cpu_stats.cpu_usage.percpu_usage?.length ?? 1;
+    if (sysDelta > 0) cpuTotal += (cpuDelta / sysDelta) * numCpus * 100;
+
+    const cache = s.memory_stats.stats?.inactive_file ?? s.memory_stats.stats?.cache ?? 0;
+    memUsed += Math.max(0, (s.memory_stats.usage ?? 0) - cache);
+    if ((s.memory_stats.limit ?? 0) > memTotal) memTotal = s.memory_stats.limit;
+
+    for (const net of Object.values(s.networks ?? {})) {
+      rxBytes += net.rx_bytes;
+      txBytes += net.tx_bytes;
+    }
+    count++;
+  }
+
+  return {
+    cpuPercent: Math.min(100, Math.round(cpuTotal * 10) / 10),
+    memoryUsedBytes: memUsed,
+    memoryTotalBytes: memTotal,
+    networkRxBytes: rxBytes,
+    networkTxBytes: txBytes,
+    sampledContainers: count
+  };
+}
 
 export async function listDockerContainers(environment: DockerEnvironment) {
   const items = await dockerRequest<DockerContainerSummary[]>(environment, "/containers/json?all=1");
@@ -121,10 +215,19 @@ export async function inspectDockerContainer(environment: DockerEnvironment, con
     state: item.State.Status,
     status: buildStatus(item.State),
     createdAt: item.State.StartedAt || new Date().toISOString(),
+    pid: item.State.Pid,
+    restartCount: item.RestartCount ?? 0,
+    startedAt: item.State.StartedAt && !item.State.StartedAt.startsWith("0001") ? item.State.StartedAt : null,
+    finishedAt: item.State.FinishedAt && !item.State.FinishedAt.startsWith("0001") ? item.State.FinishedAt : null,
+    restartPolicy: item.HostConfig?.RestartPolicy?.Name ?? "no",
+    memoryLimitBytes: item.HostConfig?.Memory ?? 0,
     publishedPorts,
     networkIps: Object.values(item.NetworkSettings.Networks ?? {})
       .map((network) => network.IPAddress)
       .filter(Boolean),
+    networks: Object.entries(item.NetworkSettings.Networks ?? {})
+      .map(([name, net]) => ({ name, ip: net.IPAddress }))
+      .filter((n) => n.ip),
     exposedPorts: Array.from(exposedKeys).map((key) => {
       const { port, protocol } = splitPortKey(key);
       const bindings = item.NetworkSettings.Ports?.[key] ?? [];
@@ -138,6 +241,82 @@ export async function inspectDockerContainer(environment: DockerEnvironment, con
       };
     })
   } satisfies ResolvedDockerContainerDetail;
+}
+
+export type DockerContainerEvent = {
+  action: "start" | "destroy";
+  containerId: string;
+  containerName: string;
+  labels: Record<string, string>;
+};
+
+export function watchDockerContainerEvents(
+  environment: DockerEnvironment,
+  onEvent: (event: DockerContainerEvent) => void,
+  onError: (error: Error) => void
+): () => void {
+  const isTls = environment.connectionType === "tls";
+  const transport = isTls ? https : http;
+  const filters = encodeURIComponent(JSON.stringify({ type: ["container"], event: ["start", "destroy"] }));
+
+  const options: http.RequestOptions & https.RequestOptions = {
+    method: "GET",
+    path: `/events?filters=${filters}`
+  };
+
+  if (environment.connectionType === "local_socket") {
+    options.socketPath = environment.socketPath ?? "/var/run/docker.sock";
+  } else {
+    options.host = environment.host ?? "127.0.0.1";
+    options.port = environment.port ?? 2375;
+  }
+
+  if (isTls) {
+    options.ca = environment.tlsCaPem ?? undefined;
+    options.cert = environment.tlsCertPem ?? undefined;
+    options.key = environment.tlsKeyPem ?? undefined;
+    options.rejectUnauthorized = Boolean(environment.tlsCaPem);
+  }
+
+  let aborted = false;
+  const req = transport.request(options, (res) => {
+    let buffer = "";
+    res.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString("utf8");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const raw = JSON.parse(trimmed) as Record<string, unknown>;
+          const action = raw["Action"] as string;
+          if (raw["Type"] === "container" && (action === "start" || action === "destroy")) {
+            const actor = (raw["Actor"] as Record<string, unknown>) ?? {};
+            const attrs = (actor["Attributes"] as Record<string, string>) ?? {};
+            onEvent({
+              action,
+              containerId: (actor["ID"] as string) ?? "",
+              containerName: ((attrs["name"] as string) ?? "").replace(/^\//, ""),
+              labels: attrs
+            });
+          }
+        } catch {
+          // skip malformed line
+        }
+      }
+    });
+    res.on("error", (err: Error) => { if (!aborted) onError(err); });
+    res.on("end", () => { if (!aborted) onError(new Error("Docker events stream closed")); });
+  });
+
+  req.on("error", (err: Error) => { if (!aborted) onError(err); });
+  req.end();
+
+  return () => {
+    aborted = true;
+    req.destroy();
+  };
 }
 
 async function dockerRequest<T>(environment: DockerEnvironment, requestPath: string): Promise<T> {
