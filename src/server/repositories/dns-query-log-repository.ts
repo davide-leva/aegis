@@ -80,12 +80,13 @@ export class DnsQueryLogRepository {
     );
   }
 
-  async getMetrics(): Promise<DnsRuntimeMetrics> {
+  async getMetrics(liveCache?: { cacheSize: number; cacheHits: number; cacheMisses: number }): Promise<DnsRuntimeMetrics> {
     const row = await this.db.get<Record<string, unknown>>(
       `SELECT
         COUNT(*) AS "totalQueries",
         SUM(CASE WHEN resolution_mode = 'authoritative' THEN 1 ELSE 0 END) AS "authoritativeQueries",
         SUM(CASE WHEN resolution_mode = 'upstream' THEN 1 ELSE 0 END) AS "upstreamQueries",
+        SUM(CASE WHEN resolution_mode = 'cached' THEN 1 ELSE 0 END) AS "cachedQueries",
         SUM(CASE WHEN resolution_mode = 'blocked' THEN 1 ELSE 0 END) AS "blockedQueries",
         SUM(CASE WHEN resolution_mode = 'nxdomain' THEN 1 ELSE 0 END) AS "nxDomainQueries",
         SUM(CASE WHEN resolution_mode = 'servfail' THEN 1 ELSE 0 END) AS "servfailQueries",
@@ -98,11 +99,15 @@ export class DnsQueryLogRepository {
       totalQueries: Number(row?.totalQueries ?? 0),
       authoritativeQueries: Number(row?.authoritativeQueries ?? 0),
       upstreamQueries: Number(row?.upstreamQueries ?? 0),
+      cachedQueries: Number(row?.cachedQueries ?? 0),
       blockedQueries: Number(row?.blockedQueries ?? 0),
       nxDomainQueries: Number(row?.nxDomainQueries ?? 0),
       servfailQueries: Number(row?.servfailQueries ?? 0),
       avgDurationMs: Number(row?.avgDurationMs ?? 0),
-      lastQueryAt: (row?.lastQueryAt as string | null | undefined) ?? null
+      lastQueryAt: (row?.lastQueryAt as string | null | undefined) ?? null,
+      cacheSize: liveCache?.cacheSize ?? 0,
+      cacheHits: liveCache?.cacheHits ?? 0,
+      cacheMisses: liveCache?.cacheMisses ?? 0
     };
   }
 }

@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
 
-import { sendValidationError } from "../lib/http.js";
+import { AppError } from "../lib/app-error.js";
+import { asyncHandler } from "../lib/async-handler.js";
+import { requireReadWrite } from "../lib/auth-middleware.js";
 import { getAuditContext } from "../lib/request-context.js";
 import { CertificateService } from "../services/certificate-service.js";
 
@@ -59,142 +61,97 @@ const serverDownloadKindSchema = z.object({
 
 export function createCertificateRouter(service: CertificateService) {
   const router = Router();
+  router.use(requireReadWrite("ca:read", "ca:write"));
 
-  router.get("/dashboard", async (req, res) => {
+  router.get("/dashboard", asyncHandler(async (req, res) => {
     res.json(await service.getDashboard(getAuditContext(req)));
-  });
+  }));
 
-  router.get("/subjects", async (req, res) => {
+  router.get("/subjects", asyncHandler(async (req, res) => {
     res.json(await service.listSubjects(getAuditContext(req)));
-  });
+  }));
 
-  router.post("/subjects", async (req, res) => {
-    try {
-      const payload = subjectSchema.parse(req.body);
-      res.status(201).json(await service.createSubject(payload, getAuditContext(req)));
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
-    }
-  });
+  router.post("/subjects", asyncHandler(async (req, res) => {
+    const payload = subjectSchema.parse(req.body);
+    res.status(201).json(await service.createSubject(payload, getAuditContext(req)));
+  }));
 
-  router.put("/subjects/:id", async (req, res) => {
+  router.put("/subjects/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const payload = subjectSchema.parse(req.body);
     try {
-      const { id } = idSchema.parse(req.params);
-      const payload = subjectSchema.parse(req.body);
       res.json(await service.updateSubject(id, payload, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Certificate subject not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Certificate subject not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.delete("/subjects/:id", async (req, res) => {
+  router.delete("/subjects/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.deleteSubject(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Certificate subject not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Certificate subject not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/cas", async (req, res) => {
+  router.get("/cas", asyncHandler(async (req, res) => {
     res.json(await service.listCertificateAuthorities(getAuditContext(req)));
-  });
+  }));
 
-  router.post("/cas", async (req, res) => {
-    try {
-      const payload = certificateAuthoritySchema.parse(req.body);
-      res.status(201).json(await service.createCertificateAuthority(payload, getAuditContext(req)));
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
-    }
-  });
+  router.post("/cas", asyncHandler(async (req, res) => {
+    const payload = certificateAuthoritySchema.parse(req.body);
+    res.status(201).json(await service.createCertificateAuthority(payload, getAuditContext(req)));
+  }));
 
-  router.get("/server-certificates", async (req, res) => {
+  router.get("/server-certificates", asyncHandler(async (req, res) => {
     res.json(await service.listServerCertificates(getAuditContext(req)));
-  });
+  }));
 
-  router.post("/server-certificates", async (req, res) => {
-    try {
-      const payload = serverCertificateSchema.parse(req.body);
-      res.status(201).json(await service.createServerCertificate(payload, getAuditContext(req)));
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
-    }
-  });
+  router.post("/server-certificates", asyncHandler(async (req, res) => {
+    const payload = serverCertificateSchema.parse(req.body);
+    res.status(201).json(await service.createServerCertificate(payload, getAuditContext(req)));
+  }));
 
-  router.post("/server-certificates/:id/renew", async (req, res) => {
+  router.post("/server-certificates/:id/renew", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.renewServerCertificate(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Server certificate not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Server certificate not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/cas/:id/download/:kind", async (req, res) => {
+  router.get("/cas/:id/download/:kind", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const { kind } = caDownloadKindSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
-      const { kind } = caDownloadKindSchema.parse(req.params);
       const result = await service.downloadCertificateAuthority(id, kind, getAuditContext(req));
       res.setHeader("Content-Type", "application/x-pem-file");
       res.setHeader("Content-Disposition", `attachment; filename="${result.fileName}"`);
       res.send(result.contents);
     } catch (error) {
-      if (error instanceof Error && error.message === "Certificate authority not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Certificate authority not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/server-certificates/:id/download/:kind", async (req, res) => {
+  router.get("/server-certificates/:id/download/:kind", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const { kind } = serverDownloadKindSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
-      const { kind } = serverDownloadKindSchema.parse(req.params);
       const result = await service.downloadServerCertificate(id, kind, getAuditContext(req));
       res.setHeader("Content-Type", "application/x-pem-file");
       res.setHeader("Content-Disposition", `attachment; filename="${result.fileName}"`);
       res.send(result.contents);
     } catch (error) {
-      if (error instanceof Error && error.message === "Server certificate not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Server certificate not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
   return router;
 }

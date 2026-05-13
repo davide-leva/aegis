@@ -3,6 +3,7 @@ import { Worker } from "node:worker_threads";
 import { EventBus } from "../events/event-bus.js";
 import type { AuditContext, DnsRuntimeStatus } from "../types.js";
 import type { Repositories } from "../repositories/index.js";
+import type { WsGateway } from "../ws/gateway.js";
 
 const systemContext: AuditContext = {
   actorType: "system",
@@ -13,8 +14,12 @@ const systemContext: AuditContext = {
 
 export class DnsRuntimeManager {
   private worker: Worker | null = null;
-  private restartDelayMs = 2000;
+  private restartCount = 0;
+  private readonly baseRestartDelay = 1000;
+  private readonly maxRestartDelay = 30000;
   private shuttingDown = false;
+  private logDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private cacheMetrics = { cacheSize: 0, cacheHits: 0, cacheMisses: 0 };
   private status: DnsRuntimeStatus = {
     state: "starting",
     pid: null,
@@ -32,7 +37,8 @@ export class DnsRuntimeManager {
   constructor(
     private readonly repositories: Repositories,
     private readonly eventBus: EventBus,
-    private readonly workerUrl: URL
+    private readonly workerUrl: URL,
+    private readonly gateway: WsGateway
   ) {}
 
   start() {
@@ -41,6 +47,7 @@ export class DnsRuntimeManager {
 
   async stop() {
     this.shuttingDown = true;
+    if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
     if (!this.worker) {
       return;
     }
@@ -53,8 +60,20 @@ export class DnsRuntimeManager {
     return this.status;
   }
 
+  getCacheMetrics() {
+    return this.cacheMetrics;
+  }
+
   requestReload() {
     this.worker?.postMessage({ type: "reload" });
+  }
+
+  private notifyNewLogs() {
+    if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
+    this.logDebounceTimer = setTimeout(() => {
+      this.gateway.broadcast(["dns-runtime-logs", "dns-runtime-metrics"]);
+      this.logDebounceTimer = null;
+    }, 500);
   }
 
   private spawnWorker(isRestart: boolean) {
@@ -71,6 +90,7 @@ export class DnsRuntimeManager {
       lastStartedAt: now,
       lastError: null
     };
+    this.gateway.broadcast(["dns-runtime-status"]);
     void this.recordSystemEvent(action, topic, {
       pid: this.worker.threadId,
       startedAt: now
@@ -81,12 +101,24 @@ export class DnsRuntimeManager {
     this.worker.on("message", (message: any) => {
       if (message.type === "status") {
         const nextStatus = message.status as DnsRuntimeStatus;
+        if (nextStatus.state === "running") this.restartCount = 0;
         this.status = {
           ...this.status,
           ...nextStatus,
           pid: this.worker?.threadId ?? nextStatus.pid,
           restarts: this.status.restarts,
           lastStartedAt: this.status.lastStartedAt ?? nextStatus.lastStartedAt
+        };
+        this.gateway.broadcast(["dns-runtime-status", "dns-runtime-metrics"]);
+      }
+      if (message.type === "log-written") {
+        this.notifyNewLogs();
+      }
+      if (message.type === "cache-metrics") {
+        this.cacheMetrics = {
+          cacheSize: message.cacheSize as number,
+          cacheHits: message.cacheHits as number,
+          cacheMisses: message.cacheMisses as number
         };
       }
       if (message.type === "runtime-error") {
@@ -95,6 +127,7 @@ export class DnsRuntimeManager {
           state: "error",
           lastError: String(message.error)
         };
+        this.gateway.broadcast(["dns-runtime-status"]);
         void this.recordSystemEvent("runtime.worker.error", "dns.runtime.error", {
           error: String(message.error)
         }).catch((error) => {
@@ -109,6 +142,7 @@ export class DnsRuntimeManager {
         state: "error",
         lastError: error.message
       };
+      this.gateway.broadcast(["dns-runtime-status"]);
       void this.recordSystemEvent("runtime.worker.error", "dns.runtime.error", {
         error: error.message
       }).catch((recordError) => {
@@ -127,6 +161,7 @@ export class DnsRuntimeManager {
           address: null
         }
       };
+      this.gateway.broadcast(["dns-runtime-status"]);
 
       void this.recordSystemEvent("runtime.worker.exit", "dns.runtime.exited", { code }).catch((error) => {
         console.error("Failed to record worker exit", error);
@@ -134,7 +169,9 @@ export class DnsRuntimeManager {
 
       this.worker = null;
       if (!this.shuttingDown) {
-        setTimeout(() => this.spawnWorker(true), this.restartDelayMs);
+        const delay = Math.min(this.baseRestartDelay * Math.pow(2, this.restartCount), this.maxRestartDelay);
+        this.restartCount++;
+        setTimeout(() => this.spawnWorker(true), delay);
       }
     });
   }

@@ -3,6 +3,7 @@ import { Worker } from "node:worker_threads";
 import { EventBus } from "../events/event-bus.js";
 import type { AuditContext, ProxyRuntimeStatus } from "../types.js";
 import type { Repositories } from "../repositories/index.js";
+import type { WsGateway } from "../ws/gateway.js";
 
 const systemContext: AuditContext = {
   actorType: "system",
@@ -13,8 +14,11 @@ const systemContext: AuditContext = {
 
 export class ProxyRuntimeManager {
   private worker: Worker | null = null;
-  private restartDelayMs = 2000;
+  private restartCount = 0;
+  private readonly baseRestartDelay = 1000;
+  private readonly maxRestartDelay = 30000;
   private shuttingDown = false;
+  private logDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private status: ProxyRuntimeStatus = {
     state: "starting",
     pid: null,
@@ -28,7 +32,8 @@ export class ProxyRuntimeManager {
   constructor(
     private readonly repositories: Repositories,
     private readonly eventBus: EventBus,
-    private readonly workerUrl: URL
+    private readonly workerUrl: URL,
+    private readonly gateway: WsGateway
   ) {}
 
   start() {
@@ -37,6 +42,7 @@ export class ProxyRuntimeManager {
 
   async stop() {
     this.shuttingDown = true;
+    if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
     if (!this.worker) {
       return;
     }
@@ -53,6 +59,14 @@ export class ProxyRuntimeManager {
     this.worker?.postMessage({ type: "reload" });
   }
 
+  private notifyNewLogs() {
+    if (this.logDebounceTimer) clearTimeout(this.logDebounceTimer);
+    this.logDebounceTimer = setTimeout(() => {
+      this.gateway.broadcast(["proxy-runtime-logs", "proxy-runtime-metrics"]);
+      this.logDebounceTimer = null;
+    }, 500);
+  }
+
   private spawnWorker(isRestart: boolean) {
     this.worker = new Worker(this.workerUrl);
     const action = isRestart ? "proxy.runtime.worker.restart" : "proxy.runtime.worker.start";
@@ -66,6 +80,7 @@ export class ProxyRuntimeManager {
       lastStartedAt: now,
       lastError: null
     };
+    this.gateway.broadcast(["proxy-runtime-status"]);
 
     void this.recordSystemEvent(action, topic, {
       pid: this.worker.threadId,
@@ -77,6 +92,7 @@ export class ProxyRuntimeManager {
     this.worker.on("message", (message: any) => {
       if (message.type === "status") {
         const nextStatus = message.status as ProxyRuntimeStatus;
+        if (nextStatus.state === "running") this.restartCount = 0;
         this.status = {
           ...this.status,
           ...nextStatus,
@@ -84,6 +100,10 @@ export class ProxyRuntimeManager {
           restarts: this.status.restarts,
           lastStartedAt: this.status.lastStartedAt ?? nextStatus.lastStartedAt
         };
+        this.gateway.broadcast(["proxy-runtime-status", "proxy-runtime-metrics"]);
+      }
+      if (message.type === "log-written") {
+        this.notifyNewLogs();
       }
       if (message.type === "runtime-error") {
         this.status = {
@@ -91,6 +111,7 @@ export class ProxyRuntimeManager {
           state: "error",
           lastError: String(message.error)
         };
+        this.gateway.broadcast(["proxy-runtime-status"]);
         void this.recordSystemEvent("proxy.runtime.worker.error", "proxy.runtime.error", {
           error: String(message.error)
         }).catch((error) => {
@@ -105,6 +126,7 @@ export class ProxyRuntimeManager {
         state: "error",
         lastError: error.message
       };
+      this.gateway.broadcast(["proxy-runtime-status"]);
       void this.recordSystemEvent("proxy.runtime.worker.error", "proxy.runtime.error", {
         error: error.message
       }).catch((recordError) => {
@@ -119,6 +141,7 @@ export class ProxyRuntimeManager {
         pid: null,
         listeners: []
       };
+      this.gateway.broadcast(["proxy-runtime-status"]);
 
       void this.recordSystemEvent("proxy.runtime.worker.exit", "proxy.runtime.exited", { code }).catch((error) => {
         console.error("Failed to record proxy worker exit", error);
@@ -126,7 +149,9 @@ export class ProxyRuntimeManager {
 
       this.worker = null;
       if (!this.shuttingDown) {
-        setTimeout(() => this.spawnWorker(true), this.restartDelayMs);
+        const delay = Math.min(this.baseRestartDelay * Math.pow(2, this.restartCount), this.maxRestartDelay);
+        this.restartCount++;
+        setTimeout(() => this.spawnWorker(true), delay);
       }
     });
   }

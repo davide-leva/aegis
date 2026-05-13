@@ -12,6 +12,7 @@ import type { NewZone } from "../repositories/dns-zone-repository.js";
 interface RuntimeControl {
   requestReload(): void;
   getStatus(): DnsRuntimeStatus;
+  getCacheMetrics?(): { cacheSize: number; cacheHits: number; cacheMisses: number };
 }
 
 export type BootstrapRootCaInput = {
@@ -35,12 +36,14 @@ export class DnsService {
   ) {}
 
   async getBootstrap(context: AuditContext) {
-    const [settings, certificateAuthority, interfaces] = await Promise.all([
+    const [settings, certificateAuthority, interfaces, acmeAccounts] = await Promise.all([
       this.repositories.resolverSettings.get(),
       this.repositories.certificateAuthorities.getDefaultRoot(),
-      this.repositories.networkInterfaces.list()
+      this.repositories.networkInterfaces.list(),
+      this.repositories.acmeAccounts.list()
     ]);
-    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces);
+    const hasAcme = acmeAccounts.length > 0;
+    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces, hasAcme);
     await this.audit("bootstrap.read", "resolver_settings", settings?.id, context, {
       ...steps
     });
@@ -56,7 +59,8 @@ export class DnsService {
             expiresAt: certificateAuthority.expiresAt,
             isDefault: certificateAuthority.isDefault
           }
-        : null
+        : null,
+      acmeConfigured: hasAcme
     };
   }
 
@@ -178,16 +182,17 @@ export class DnsService {
   }
 
   async getDashboard(context: AuditContext) {
-    const [settings, zones, records, upstreams, blocklist, certificateAuthority, interfaces] = await Promise.all([
+    const [settings, zones, records, upstreams, blocklist, certificateAuthority, interfaces, acmeAccounts] = await Promise.all([
       this.repositories.resolverSettings.get(),
       this.repositories.zones.list(),
       this.repositories.records.list(),
       this.repositories.upstreams.list(),
       this.repositories.blocklist.list(),
       this.repositories.certificateAuthorities.getDefaultRoot(),
-      this.repositories.networkInterfaces.list()
+      this.repositories.networkInterfaces.list(),
+      this.repositories.acmeAccounts.list()
     ]);
-    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces);
+    const steps = buildBootstrapStatus(settings, certificateAuthority, interfaces, acmeAccounts.length > 0);
 
     const dashboard = {
       bootstrapCompleted: steps.completed,
@@ -589,7 +594,7 @@ export class DnsService {
   }
 
   async listEvents(context: AuditContext, limit = 100) {
-    const events = await this.repositories.events.list(limit);
+    const events = await this.repositories.events.list({ limit });
     await this.audit("event.list", "domain_event", null, context, { count: events.length, limit });
     return events;
   }
@@ -615,7 +620,8 @@ export class DnsService {
   }
 
   async getRuntimeMetrics(context: AuditContext) {
-    const metrics = await this.repositories.queryLogs.getMetrics();
+    const liveCache = this.runtimeControl?.getCacheMetrics?.();
+    const metrics = await this.repositories.queryLogs.getMetrics(liveCache);
     await this.audit("runtime.metrics.read", "dns_runtime", null, context, metrics as unknown as Record<string, unknown>);
     return metrics;
   }
@@ -643,12 +649,13 @@ export class DnsService {
   }
 
   private async publishBootstrapCompletedIfReady(context: AuditContext) {
-    const [settings, authority, interfaces] = await Promise.all([
+    const [settings, authority, interfaces, acmeAccounts] = await Promise.all([
       this.repositories.resolverSettings.get(),
       this.repositories.certificateAuthorities.getDefaultRoot(),
-      this.repositories.networkInterfaces.list()
+      this.repositories.networkInterfaces.list(),
+      this.repositories.acmeAccounts.list()
     ]);
-    const steps = buildBootstrapStatus(settings, authority, interfaces);
+    const steps = buildBootstrapStatus(settings, authority, interfaces, acmeAccounts.length > 0);
     if (!steps.completed || !settings?.id) {
       return;
     }
@@ -670,11 +677,12 @@ export class DnsService {
 function buildBootstrapStatus(
   settings: Awaited<ReturnType<Repositories["resolverSettings"]["get"]>>,
   certificateAuthority: Awaited<ReturnType<Repositories["certificateAuthorities"]["getDefaultRoot"]>>,
-  interfaces: Awaited<ReturnType<Repositories["networkInterfaces"]["list"]>>
+  interfaces: Awaited<ReturnType<Repositories["networkInterfaces"]["list"]>>,
+  hasAcme = false
 ) {
   const steps = {
     dnsConfigured: Boolean(settings),
-    primaryCaConfigured: Boolean(certificateAuthority),
+    primaryCaConfigured: Boolean(certificateAuthority) || hasAcme,
     interfacesConfigured: interfaces.some((entry) => entry.enabled) && interfaces.some((entry) => entry.enabled && entry.isDefault),
     completed: false
   };

@@ -9,7 +9,15 @@ import type { BlocklistEntry, DnsRecord, DnsRuntimeStatus, DnsUpstream, DnsZone 
 
 const { Packet } = DNS;
 
-type ResolutionMode = "authoritative" | "upstream" | "blocked" | "nxdomain" | "servfail";
+type ResolutionMode = "authoritative" | "upstream" | "cached" | "blocked" | "nxdomain" | "servfail";
+
+type CacheEntry = {
+  answers: unknown[];
+  authorities?: unknown[];
+  additionals?: unknown[];
+  rcode: number;
+  expiresAt: number;
+};
 
 type Snapshot = {
   listenPort: number;
@@ -34,6 +42,35 @@ let refreshTimer: NodeJS.Timeout | null = null;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let currentPort: number | null = null;
 let currentAddress = process.env.DNS_BIND_ADDRESS ?? "0.0.0.0";
+
+const queryCache = new Map<string, CacheEntry>();
+const MAX_CACHE_SIZE = 2000;
+const MAX_CACHE_TTL_MS = 300_000;
+let cacheHits = 0;
+let cacheMisses = 0;
+
+function cacheGet(key: string): CacheEntry | null {
+  const entry = queryCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    queryCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function cacheSet(key: string, entry: CacheEntry) {
+  if (queryCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = queryCache.keys().next().value;
+    if (firstKey !== undefined) queryCache.delete(firstKey);
+  }
+  queryCache.set(key, entry);
+}
+
+function postCacheMetrics() {
+  post({ type: "cache-metrics", cacheSize: queryCache.size, cacheHits, cacheMisses });
+}
+
 let status: DnsRuntimeStatus = {
   state: "starting",
   pid: threadId,
@@ -212,6 +249,7 @@ async function restartServer() {
         zoneName: resolved.zoneName,
         upstreamName: resolved.upstreamName
       });
+      post({ type: "log-written" });
     }
   });
 
@@ -448,16 +486,47 @@ async function resolveQuestion(questionName: string, type: number, protocol: "ud
     };
   }
 
+  const cacheKey = `${name}:${qtype}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    cacheHits++;
+    postCacheMetrics();
+    return {
+      authoritative: false,
+      rcode: cached.rcode,
+      answers: cached.answers,
+      authorities: cached.authorities ?? [],
+      additionals: cached.additionals ?? [],
+      mode: "cached" as ResolutionMode,
+      zoneName: zone?.name ?? null,
+      upstreamName: null
+    };
+  }
+  cacheMisses++;
+
   for (const upstream of snapshot.upstreams) {
     try {
       const upstreamResponse = await queryUpstream(upstream, name, qtype) as any;
+      const answers: unknown[] = upstreamResponse.answers ?? [];
+      const rcode: number = upstreamResponse.header?.rcode ?? 0;
+      if (rcode === 0 && answers.length > 0) {
+        const minTtl = answers.reduce((min: number, a: any) => Math.min(min, (a.ttl ?? 60) * 1000), MAX_CACHE_TTL_MS);
+        const ttlMs = Math.max(10_000, Math.min(minTtl, MAX_CACHE_TTL_MS));
+        cacheSet(cacheKey, {
+          answers,
+          authorities: upstreamResponse.authorities ?? [],
+          additionals: upstreamResponse.additionals ?? [],
+          rcode,
+          expiresAt: Date.now() + ttlMs
+        });
+      }
       return {
         authoritative: false,
-        rcode: upstreamResponse.header?.rcode ?? 0,
-        answers: upstreamResponse.answers ?? [],
+        rcode,
+        answers,
         authorities: upstreamResponse.authorities ?? [],
         additionals: upstreamResponse.additionals ?? [],
-        mode: upstreamResponse.answers?.length ? ("upstream" as ResolutionMode) : ("nxdomain" as ResolutionMode),
+        mode: answers.length ? ("upstream" as ResolutionMode) : ("nxdomain" as ResolutionMode),
         zoneName: zone?.name ?? null,
         upstreamName: upstream.name
       };
@@ -532,6 +601,7 @@ async function start() {
     updateStatus({
       lastHeartbeatAt: new Date().toISOString()
     });
+    postCacheMetrics();
   }, 3000);
 
   await refreshSnapshot();

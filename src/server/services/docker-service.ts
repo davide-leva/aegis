@@ -67,7 +67,7 @@ type AutomapIssue = {
 export class DockerService {
   constructor(
     private readonly repositories: Repositories,
-    private readonly eventBus: EventBus,
+    _eventBus: EventBus,
     private readonly proxyRuntimeControl?: ProxyRuntimeControl,
     private readonly dnsRuntimeControl?: DnsRuntimeControl
   ) {}
@@ -584,7 +584,7 @@ export class DockerService {
   }
 
   private async listContainerAutomapEvents(containerId: string, limit = 12) {
-    const events = await this.repositories.events.list(Math.max(limit * 6, 60));
+    const events = await this.repositories.events.list({ limit: Math.max(limit * 6, 60) });
     return events
       .filter(
         (event) =>
@@ -671,6 +671,21 @@ export class DockerService {
     }
   }
 
+  async deletePortMapping(mappingId: number, context: AuditContext) {
+    const mapping = await this.repositories.dockerPortMappings.getById(mappingId);
+    if (!mapping) throw new Error("Mapping not found");
+
+    await this.repositories.db.transaction(async (trx) => {
+      const repos = createRepositories(trx);
+      const events = new EventBus(repos);
+      await releaseMappingResources(repos, events, mapping, "manual", context);
+    });
+
+    this.proxyRuntimeControl?.requestReload();
+    this.dnsRuntimeControl?.requestReload();
+    return { deleted: mappingId };
+  }
+
   async releaseContainerMappings(containerId: string, context: AuditContext) {
     const mappings = await this.repositories.dockerPortMappings.listByContainerId(containerId);
     if (mappings.length === 0) return { released: 0 };
@@ -679,56 +694,101 @@ export class DockerService {
       await this.repositories.db.transaction(async (trx) => {
         const repos = createRepositories(trx);
         const events = new EventBus(repos);
-
-        const route = mapping.proxyRouteId ? await repos.proxyRoutes.getById(mapping.proxyRouteId) : null;
-        const dnsName = route?.sourceHost ?? null;
-
-        if (route) {
-          await repos.proxyRoutes.delete(route.id);
-          await repos.audit.create({
-            action: "proxy.route.delete",
-            entityType: "proxy_route",
-            entityId: String(route.id),
-            payload: route,
-            context
-          });
-          await events.publish({
-            topic: "proxy.route.deleted",
-            aggregateType: "proxy_route",
-            aggregateId: String(route.id),
-            payload: route,
-            context
-          });
-        }
-
-        if (dnsName) {
-          const remainingRoutes = (await repos.proxyRoutes.list()).filter((r) => r.sourceHost === dnsName);
-          if (remainingRoutes.length === 0) {
-            await tryDeleteManagedDnsRecord(repos, events, dnsName, context);
-          }
-        }
-
-        await repos.dockerPortMappings.deleteById(mapping.id);
-        await repos.audit.create({
-          action: "docker.mapping.delete",
-          entityType: "docker_mapping",
-          entityId: String(mapping.id),
-          payload: { mappingId: mapping.id, containerId, reason: "container_removed" },
-          context
-        });
-        await events.publish({
-          topic: "docker.mapping.deleted",
-          aggregateType: "docker_mapping",
-          aggregateId: String(mapping.id),
-          payload: { mappingId: mapping.id, containerId, reason: "container_removed" },
-          context
-        });
+        await releaseMappingResources(repos, events, mapping, "container_removed", context);
       });
     }
 
     this.proxyRuntimeControl?.requestReload();
     this.dnsRuntimeControl?.requestReload();
     return { released: mappings.length };
+  }
+}
+
+async function releaseMappingResources(
+  repos: Repositories,
+  events: EventBus,
+  mapping: { id: number; proxyRouteId: number; containerId: string },
+  reason: string,
+  context: AuditContext
+) {
+  const route = mapping.proxyRouteId ? await repos.proxyRoutes.getById(mapping.proxyRouteId) : null;
+  const dnsName = route?.sourceHost ?? null;
+
+  if (route) {
+    await repos.proxyRoutes.delete(route.id);
+    await repos.audit.create({
+      action: "proxy.route.delete",
+      entityType: "proxy_route",
+      entityId: String(route.id),
+      payload: route,
+      context
+    });
+    await events.publish({
+      topic: "proxy.route.deleted",
+      aggregateType: "proxy_route",
+      aggregateId: String(route.id),
+      payload: route,
+      context
+    });
+
+    if (route.tlsCertPem) {
+      await tryDeleteManagedCertificate(repos, route.tlsCertPem, context);
+    }
+  }
+
+  if (dnsName) {
+    const remainingRoutes = (await repos.proxyRoutes.list()).filter((r) => r.sourceHost === dnsName);
+    if (remainingRoutes.length === 0) {
+      await tryDeleteManagedDnsRecord(repos, events, dnsName, context);
+    }
+  }
+
+  await repos.dockerPortMappings.deleteById(mapping.id);
+  await repos.audit.create({
+    action: "docker.mapping.delete",
+    entityType: "docker_mapping",
+    entityId: String(mapping.id),
+    payload: { mappingId: mapping.id, containerId: mapping.containerId, reason },
+    context
+  });
+  await events.publish({
+    topic: "docker.mapping.deleted",
+    aggregateType: "docker_mapping",
+    aggregateId: String(mapping.id),
+    payload: { mappingId: mapping.id, containerId: mapping.containerId, reason },
+    context
+  });
+}
+
+async function tryDeleteManagedCertificate(
+  repos: Repositories,
+  certificatePem: string,
+  context: AuditContext
+) {
+  const cert = await repos.serverCertificates.findByCertificatePem(certificatePem);
+  if (!cert) return;
+
+  const allCerts = await repos.serverCertificates.list();
+  const siblingCount = allCerts.filter((c) => c.subjectId === cert.subjectId).length;
+
+  await repos.serverCertificates.delete(cert.id);
+  await repos.audit.create({
+    action: "certificate.server.delete",
+    entityType: "server_certificate",
+    entityId: String(cert.id),
+    payload: { id: cert.id, reason: "mapping_deleted" },
+    context
+  });
+
+  if (siblingCount <= 1) {
+    await repos.certificateSubjects.delete(cert.subjectId);
+    await repos.audit.create({
+      action: "certificate.subject.delete",
+      entityType: "certificate_subject",
+      entityId: String(cert.subjectId),
+      payload: { id: cert.subjectId, reason: "mapping_deleted" },
+      context
+    });
   }
 }
 
@@ -1257,7 +1317,7 @@ async function publishContainerAutomapEventOnce(
     payload: Record<string, unknown> & { signature: string };
   }
 ) {
-  const recent = await repos.events.list(120);
+  const recent = await repos.events.list({ limit: 120 });
   const duplicated = recent.some((event) => {
     if (event.topic !== input.topic || event.aggregateType !== "docker_container" || event.aggregateId !== input.containerId) {
       return false;

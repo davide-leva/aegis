@@ -1,25 +1,12 @@
 import type { DatabaseContext, ServerCertificate } from "../types.js";
-import { boolValue, mapRecord, mapRows, placeholder, resolveInsertedId } from "./helpers.js";
+import { boolValue, mapRecord, mapRows, parseJsonArray, placeholder, resolveInsertedId } from "./helpers.js";
 
 export type NewServerCertificate = Omit<
   ServerCertificate,
   "id" | "createdAt" | "updatedAt" | "subjectName" | "caName" | "commonName"
 >;
 
-function parseSubjectAltNames(value: unknown) {
-  if (Array.isArray(value)) {
-    return value.map((entry) => String(entry));
-  }
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value);
-      return Array.isArray(parsed) ? parsed.map((entry) => String(entry)) : [];
-    } catch {
-      return [];
-    }
-  }
-  return [];
-}
+const parseSubjectAltNames = (value: unknown) => parseJsonArray<string>(value).map(String);
 
 function mapServerCertificate(row: (ServerCertificate & Record<string, unknown>) | undefined) {
   const mapped = mapRecord(row);
@@ -139,6 +126,13 @@ export class ServerCertificateRepository {
     );
     const id = await resolveInsertedId(this.db, result.lastInsertId);
     return this.getById(Number(id));
+  }
+
+  async findByCertificatePem(certificatePem: string): Promise<{ id: number; subjectId: number } | undefined> {
+    return this.db.get<{ id: number; subjectId: number }>(
+      `SELECT id, subject_id AS "subjectId" FROM server_certificates WHERE certificate_pem = ${placeholder(1, this.db)}`,
+      [certificatePem]
+    );
   }
 
   async delete(id: number): Promise<void> {

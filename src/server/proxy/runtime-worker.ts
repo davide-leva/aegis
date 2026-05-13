@@ -485,13 +485,14 @@ function createSniCallback(routes: ProxyRoute[]) {
     if (!route.sourceHost || !route.tlsCertPem || !route.tlsKeyPem) {
       continue;
     }
-    contexts.set(
-      route.sourceHost.toLowerCase(),
-      tls.createSecureContext({
-        cert: route.tlsCertPem,
-        key: route.tlsKeyPem
-      })
-    );
+    try {
+      contexts.set(
+        route.sourceHost.toLowerCase(),
+        tls.createSecureContext({ cert: route.tlsCertPem, key: route.tlsKeyPem })
+      );
+    } catch (error) {
+      console.error(`Failed to create TLS context for ${route.sourceHost}:`, error);
+    }
   }
 
   return (servername: string, callback: (error: Error | null, context?: tls.SecureContext) => void) => {
@@ -645,6 +646,7 @@ async function logProxyRequest(input: Omit<ProxyRequestLogEntry, "id" | "created
     await repositories.proxyLogs.create({
       ...input
     });
+    parentPort?.postMessage({ type: "log-written" });
   } catch (error) {
     console.error("Failed to persist proxy request log", error);
   }

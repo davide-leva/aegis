@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
 
-import { sendValidationError } from "../lib/http.js";
+import { AppError } from "../lib/app-error.js";
+import { asyncHandler } from "../lib/async-handler.js";
+import { requireReadWrite } from "../lib/auth-middleware.js";
 import { getAuditContext } from "../lib/request-context.js";
 import { ProxyService } from "../services/proxy-service.js";
 
@@ -32,77 +34,64 @@ const idSchema = z.object({
 
 export function createProxyRouter(service: ProxyService) {
   const router = Router();
+  router.use(requireReadWrite("proxy:read", "proxy:write"));
 
-  router.get("/dashboard", async (req, res) => {
+  router.get("/dashboard", asyncHandler(async (req, res) => {
     res.json(await service.getDashboard(getAuditContext(req)));
-  });
+  }));
 
-  router.get("/routes", async (req, res) => {
+  router.get("/routes", asyncHandler(async (req, res) => {
     res.json(await service.listRoutes(getAuditContext(req)));
-  });
+  }));
 
-  router.post("/routes", async (req, res) => {
-    try {
-      const payload = routeSchema.parse(req.body);
-      res.status(201).json(await service.createRoute(payload, getAuditContext(req)));
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
-    }
-  });
+  router.post("/routes", asyncHandler(async (req, res) => {
+    const payload = routeSchema.parse(req.body);
+    res.status(201).json(await service.createRoute(payload, getAuditContext(req)));
+  }));
 
-  router.put("/routes/:id", async (req, res) => {
+  router.put("/routes/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const payload = routeSchema.parse(req.body);
     try {
-      const { id } = idSchema.parse(req.params);
-      const payload = routeSchema.parse(req.body);
       res.json(await service.updateRoute(id, payload, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Proxy route not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Proxy route not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.delete("/routes/:id", async (req, res) => {
+  router.delete("/routes/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.deleteRoute(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Proxy route not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Proxy route not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/audit", async (req, res) => {
+  router.get("/audit", asyncHandler(async (req, res) => {
     const { limit } = limitSchema.parse(req.query);
     res.json(await service.listAuditLogs(getAuditContext(req), limit));
-  });
+  }));
 
-  router.get("/events", async (req, res) => {
+  router.get("/events", asyncHandler(async (req, res) => {
     const { limit } = limitSchema.parse(req.query);
     res.json(await service.listEvents(getAuditContext(req), limit));
-  });
+  }));
 
-  router.get("/runtime/status", async (req, res) => {
+  router.get("/runtime/status", asyncHandler(async (req, res) => {
     res.json(await service.getRuntimeStatus(getAuditContext(req)));
-  });
+  }));
 
-  router.get("/runtime/metrics", async (req, res) => {
+  router.get("/runtime/metrics", asyncHandler(async (req, res) => {
     res.json(await service.getRuntimeMetrics(getAuditContext(req)));
-  });
+  }));
 
-  router.get("/runtime/logs", async (req, res) => {
+  router.get("/runtime/logs", asyncHandler(async (req, res) => {
     const { limit } = limitSchema.parse(req.query);
     res.json(await service.listRuntimeLogs(getAuditContext(req), limit));
-  });
+  }));
 
   return router;
 }

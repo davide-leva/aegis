@@ -153,7 +153,7 @@ export class ProxyService {
   }
 
   async listEvents(context: AuditContext, limit = 100) {
-    const events = await this.repositories.events.list(Math.max(limit * 3, limit));
+    const events = await this.repositories.events.list({ limit: Math.max(limit * 3, limit) });
     const filtered = events
       .filter((entry) => entry.topic.startsWith("proxy."))
       .slice(0, limit);

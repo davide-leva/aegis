@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { z } from "zod";
 
-import { sendValidationError } from "../lib/http.js";
+import { AppError } from "../lib/app-error.js";
+import { asyncHandler } from "../lib/async-handler.js";
+import { requireReadWrite } from "../lib/auth-middleware.js";
 import { getAuditContext } from "../lib/request-context.js";
 import { DockerService } from "../services/docker-service.js";
 
@@ -45,131 +47,98 @@ const mappingSchema = z.object({
 
 export function createDockerRouter(service: DockerService) {
   const router = Router();
+  router.use(requireReadWrite("docker:read", "docker:write"));
 
-  router.get("/dashboard", async (req, res) => {
+  router.get("/dashboard", asyncHandler(async (req, res) => {
     res.json(await service.getDashboard(getAuditContext(req)));
-  });
+  }));
 
-  router.get("/environments", async (req, res) => {
+  router.get("/environments", asyncHandler(async (req, res) => {
     res.json(await service.listEnvironments(getAuditContext(req)));
-  });
+  }));
 
-  router.post("/environments", async (req, res) => {
-    try {
-      const payload = environmentSchema.parse(req.body);
-      res.status(201).json(await service.createEnvironment(payload, getAuditContext(req)));
-    } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
-    }
-  });
+  router.post("/environments", asyncHandler(async (req, res) => {
+    const payload = environmentSchema.parse(req.body);
+    res.status(201).json(await service.createEnvironment(payload, getAuditContext(req)));
+  }));
 
-  router.put("/environments/:id", async (req, res) => {
+  router.put("/environments/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const payload = environmentSchema.parse(req.body);
     try {
-      const { id } = idSchema.parse(req.params);
-      const payload = environmentSchema.parse(req.body);
       res.json(await service.updateEnvironment(id, payload, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.delete("/environments/:id", async (req, res) => {
+  router.delete("/environments/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.deleteEnvironment(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/environments/:id/resource-stats", async (req, res) => {
+  router.get("/environments/:id/resource-stats", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.getEnvironmentResourceStats(id));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(500).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/environments/:id/containers", async (req, res) => {
+  router.get("/environments/:id/containers", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
       res.json(await service.listContainers(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.get("/environments/:id/containers/:containerId", async (req, res) => {
+  router.get("/environments/:id/containers/:containerId", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const { containerId } = containerIdSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
-      const { containerId } = containerIdSchema.parse(req.params);
       res.json(await service.getContainerDetail(id, containerId, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.post("/environments/:id/containers/:containerId/automap", async (req, res) => {
+  router.post("/environments/:id/containers/:containerId/automap", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
+    const { containerId } = containerIdSchema.parse(req.params);
     try {
-      const { id } = idSchema.parse(req.params);
-      const { containerId } = containerIdSchema.parse(req.params);
       res.status(201).json(await service.autoMapContainer(id, containerId, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error && error.message === "Docker environment not found") {
-        return res.status(404).json({ error: error.message });
-      }
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Docker environment not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
-  router.post("/mappings", async (req, res) => {
+  router.post("/mappings", asyncHandler(async (req, res) => {
+    const payload = mappingSchema.parse(req.body);
+    res.status(201).json(await service.createPortMapping(payload, getAuditContext(req)));
+  }));
+
+  router.delete("/mappings/:id", asyncHandler(async (req, res) => {
+    const { id } = idSchema.parse(req.params);
     try {
-      const payload = mappingSchema.parse(req.body);
-      res.status(201).json(await service.createPortMapping(payload, getAuditContext(req)));
+      res.json(await service.deletePortMapping(id, getAuditContext(req)));
     } catch (error) {
-      if (error instanceof Error) {
-        return res.status(400).json({ error: error.message });
-      }
-      return sendValidationError(res, error);
+      if (error instanceof Error && error.message === "Mapping not found") throw AppError.notFound(error.message);
+      throw error;
     }
-  });
+  }));
 
   return router;
 }

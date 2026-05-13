@@ -186,6 +186,28 @@ export class ProxyRouteRepository {
     return this.getById(id);
   }
 
+  async updateHealthStatus(id: number, status: "healthy" | "degraded" | "unknown") {
+    const now = new Date().toISOString();
+    await this.db.run(
+      `UPDATE proxy_routes SET health_status = ${placeholder(1, this.db)}, updated_at = ${placeholder(2, this.db)}
+       WHERE id = ${placeholder(3, this.db)}`,
+      [status, now, id]
+    );
+  }
+
+  async updateTlsCert(oldCertPem: string, newCertPem: string, newKeyPem: string): Promise<number> {
+    const now = new Date().toISOString();
+    await this.db.run(
+      `UPDATE proxy_routes
+       SET tls_cert_pem = ${placeholder(1, this.db)},
+           tls_key_pem = ${placeholder(2, this.db)},
+           updated_at = ${placeholder(3, this.db)}
+       WHERE tls_cert_pem = ${placeholder(4, this.db)}`,
+      [newCertPem, newKeyPem, now, oldCertPem]
+    );
+    return 0;
+  }
+
   async delete(id: number) {
     const existing = await this.getById(id);
     if (!existing) {
