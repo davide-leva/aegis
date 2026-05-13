@@ -1,6 +1,6 @@
-import { useMemo } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Boxes, Link2, RefreshCcw, ShieldCheck } from "lucide-react";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Activity, Boxes, Link2, RefreshCcw, ShieldCheck, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 
 import { AppShell } from "@/components/layout/app-shell";
@@ -8,8 +8,19 @@ import { Badge } from "@/components/ui/badge";
 import type { BadgeVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger
+} from "@/components/ui/dialog";
 import { api } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { MetricCard } from "@/components/ui/metric-card";
+import { ProtocolBadge } from "@/components/ui/protocol-badge";
 
 type DockerPortMapping = {
   id: number;
@@ -80,6 +91,16 @@ export function MappingsPage() {
     queryClient.invalidateQueries({ queryKey: ["docker-dashboard"] });
     queryClient.invalidateQueries({ queryKey: ["proxy-dashboard"] });
   };
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: number) => api(`/api/docker/mappings/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["docker-dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["proxy-dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["certificates-dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["server-certificates"] });
+    }
+  });
 
   const enriched = useMemo<EnrichedMapping[]>(() => {
     if (!docker.data || !proxy.data) return [];
@@ -176,7 +197,7 @@ export function MappingsPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <MappingsTable mappings={mappings} />
+                <MappingsTable mappings={mappings} onDelete={(id) => deleteMutation.mutate(id)} deleting={deleteMutation.isPending} />
               </CardContent>
             </Card>
           ))}
@@ -186,7 +207,15 @@ export function MappingsPage() {
   );
 }
 
-function MappingsTable({ mappings }: { mappings: EnrichedMapping[] }) {
+function MappingsTable({
+  mappings,
+  onDelete,
+  deleting
+}: {
+  mappings: EnrichedMapping[];
+  onDelete: (id: number) => void;
+  deleting: boolean;
+}) {
   return (
     <div className="overflow-x-auto">
       <table className="min-w-full text-left text-sm">
@@ -198,11 +227,12 @@ function MappingsTable({ mappings }: { mappings: EnrichedMapping[] }) {
             <th className="px-4 py-3 font-medium">Listen</th>
             <th className="px-4 py-3 font-medium">Target</th>
             <th className="px-4 py-3 font-medium text-right">Status</th>
+            <th className="px-4 py-3 font-medium text-right"></th>
           </tr>
         </thead>
         <tbody>
           {mappings.map((mapping) => (
-            <MappingRow key={mapping.id} mapping={mapping} />
+            <MappingRow key={mapping.id} mapping={mapping} onDelete={onDelete} deleting={deleting} />
           ))}
         </tbody>
       </table>
@@ -210,8 +240,17 @@ function MappingsTable({ mappings }: { mappings: EnrichedMapping[] }) {
   );
 }
 
-function MappingRow({ mapping }: { mapping: EnrichedMapping }) {
+function MappingRow({
+  mapping,
+  onDelete,
+  deleting
+}: {
+  mapping: EnrichedMapping;
+  onDelete: (id: number) => void;
+  deleting: boolean;
+}) {
   const { route } = mapping;
+  const [open, setOpen] = useState(false);
 
   return (
     <tr className="border-b border-border/70 transition-colors hover:bg-secondary/20">
@@ -276,13 +315,46 @@ function MappingRow({ mapping }: { mapping: EnrichedMapping }) {
           )}
         </div>
       </td>
+      <td className="px-4 py-3 align-middle text-right">
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogTrigger asChild>
+            <Button variant="ghost" className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive">
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </DialogTrigger>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Remove mapping</DialogTitle>
+              <DialogDescription>
+                This will permanently delete the mapping for{" "}
+                <span className="font-medium text-foreground">{mapping.containerName}</span> port{" "}
+                <span className="font-mono">{mapping.privatePort}/{mapping.protocol}</span>, along with its
+                proxy route{route?.protocol === "https" ? ", TLS certificate and certificate subject" : ""}.
+                DNS records shared with other routes are preserved.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <DialogClose asChild>
+                <Button variant="secondary">Cancel</Button>
+              </DialogClose>
+              <Button
+                variant="default"
+                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                disabled={deleting}
+                onClick={() => {
+                  onDelete(mapping.id);
+                  setOpen(false);
+                }}
+              >
+                <Trash2 className="h-4 w-4" />
+                Remove
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      </td>
     </tr>
   );
-}
-
-function ProtocolBadge({ protocol }: { protocol: "http" | "https" | "tcp" | "udp" }) {
-  const variants: Record<string, BadgeVariant> = { http: "default", https: "success", tcp: "warning", udp: "muted" };
-  return <Badge variant={variants[protocol] ?? "default"}>{protocol.toUpperCase()}</Badge>;
 }
 
 function healthVariant(status: string): BadgeVariant {
@@ -291,34 +363,3 @@ function healthVariant(status: string): BadgeVariant {
   return "muted";
 }
 
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  detail,
-  valueClassName
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: number;
-  detail: string;
-  valueClassName?: string;
-}) {
-  return (
-    <Card className="relative overflow-hidden bg-background/20">
-      <CardContent className="flex items-center gap-4 p-5">
-        <span className="pointer-events-none absolute -right-2 bottom-0 top-0 flex select-none items-center text-[72px] font-black leading-none text-foreground/[0.04]">
-          {value}
-        </span>
-        <div className="relative rounded-md border border-primary/20 bg-primary/10 p-3">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-        <div className="relative">
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className={cn("text-2xl font-semibold text-foreground", valueClassName)}>{value}</p>
-          <p className="text-xs text-muted-foreground">{detail}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}

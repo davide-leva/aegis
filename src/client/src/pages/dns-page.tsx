@@ -32,6 +32,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
+import { Field } from "@/components/ui/field";
+import { MetricCard } from "@/components/ui/metric-card";
+import { SimpleTable } from "@/components/ui/simple-table";
 type Settings = {
   organizationName: string;
   primaryContactEmail: string;
@@ -123,6 +126,7 @@ type BootstrapState = {
     expiresAt: string;
     isDefault: boolean;
   } | null;
+  acmeConfigured: boolean;
 };
 
 type BootstrapCaForm = {
@@ -136,6 +140,11 @@ type BootstrapCaForm = {
   emailAddress: string;
   validityDays: number;
   pathLength: number | null;
+};
+
+type BootstrapAcmeForm = {
+  cloudflareApiToken: string;
+  directoryUrl: string;
 };
 
 type NetworkInterfaceConfig = {
@@ -204,6 +213,20 @@ export function DnsPage() {
   const bootstrapCaMutation = useMutation({
     mutationFn: (payload: BootstrapCaForm) =>
       api("/api/dns/bootstrap/ca", { method: "POST", body: JSON.stringify(normalizeBootstrapCaForm(payload)) }),
+    onSuccess: refreshAll
+  });
+  const bootstrapAcmeMutation = useMutation({
+    mutationFn: async (payload: BootstrapAcmeForm) => {
+      const email = bootstrapState.data?.settings?.primaryContactEmail ?? "";
+      const cred = await api<{ id: number }>("/api/cloudflare/credentials", {
+        method: "POST",
+        body: JSON.stringify({ name: "cloudflare-default", apiToken: payload.cloudflareApiToken })
+      });
+      await api("/api/acme/accounts", {
+        method: "POST",
+        body: JSON.stringify({ name: "acme-default", email, directoryUrl: payload.directoryUrl, cloudflareCredentialId: cred.id })
+      });
+    },
     onSuccess: refreshAll
   });
   const bootstrapInterfacesMutation = useMutation({
@@ -404,12 +427,15 @@ export function DnsPage() {
           networkInterfaces={networkInterfaces.data}
           dnsLoading={bootstrapSettingsMutation.isPending}
           caLoading={bootstrapCaMutation.isPending}
+          acmeLoading={bootstrapAcmeMutation.isPending}
           interfacesLoading={bootstrapInterfacesMutation.isPending}
           onSubmitDns={(values) => bootstrapSettingsMutation.mutate(values)}
           onSubmitCa={(values) => bootstrapCaMutation.mutate(values)}
+          onSubmitAcme={(values) => bootstrapAcmeMutation.mutate(values)}
           onSubmitInterfaces={(values) => bootstrapInterfacesMutation.mutate(values)}
           dnsError={bootstrapSettingsMutation.error instanceof Error ? bootstrapSettingsMutation.error.message : null}
           caError={bootstrapCaMutation.error instanceof Error ? bootstrapCaMutation.error.message : null}
+          acmeError={bootstrapAcmeMutation.error instanceof Error ? bootstrapAcmeMutation.error.message : null}
           interfacesError={bootstrapInterfacesMutation.error instanceof Error ? bootstrapInterfacesMutation.error.message : null}
         />
       ) : null}
@@ -528,36 +554,51 @@ function CreateDialog({
   );
 }
 
+const ACME_DIRECTORIES_BOOTSTRAP = [
+  { label: "Let's Encrypt (production)", value: "https://acme-v02.api.letsencrypt.org/directory" },
+  { label: "Let's Encrypt (staging)", value: "https://acme-staging-v02.api.letsencrypt.org/directory" },
+  { label: "ZeroSSL", value: "https://acme.zerossl.com/v2/DV90" }
+];
+
 function BootstrapOverlay({
   bootstrap,
   networkInterfaces,
   onSubmitDns,
   onSubmitCa,
+  onSubmitAcme,
   onSubmitInterfaces,
   dnsLoading,
   caLoading,
+  acmeLoading,
   interfacesLoading,
   dnsError,
   caError,
+  acmeError,
   interfacesError
 }: {
   bootstrap?: BootstrapState;
   networkInterfaces?: NetworkInterfacesState;
   onSubmitDns: (values: BootstrapForm) => void;
   onSubmitCa: (values: BootstrapCaForm) => void;
+  onSubmitAcme: (values: BootstrapAcmeForm) => void;
   onSubmitInterfaces: (values: NetworkInterfaceConfig[]) => void;
   dnsLoading: boolean;
   caLoading: boolean;
+  acmeLoading: boolean;
   interfacesLoading: boolean;
   dnsError: string | null;
   caError: string | null;
+  acmeError: string | null;
   interfacesError: string | null;
 }) {
+  const email = bootstrap?.settings?.primaryContactEmail ?? "";
+  const org = bootstrap?.settings?.organizationName ?? "";
+
   const dnsForm = useForm<BootstrapForm>({
     defaultValues: {
-      organizationName: "Aegis Corp",
-      primaryContactEmail: "dns@azienda.local",
-      defaultZoneSuffix: "azienda.local",
+      organizationName: "",
+      primaryContactEmail: "",
+      defaultZoneSuffix: "",
       upstreamMode: "redundant",
       dnsListenPort: 53,
       blocklistEnabled: true
@@ -565,34 +606,44 @@ function BootstrapOverlay({
   });
   const caForm = useForm<BootstrapCaForm>({
     defaultValues: {
-      name: "Aegis Root CA",
-      commonName: "Aegis Root CA",
-      organization: bootstrap?.settings?.organizationName ?? "Aegis Corp",
-      organizationalUnit: "Infrastructure",
-      country: "IT",
+      name: "rootca-default",
+      commonName: org || "Aegis Root CA",
+      organization: org,
+      organizationalUnit: "",
+      country: "",
       state: "",
       locality: "",
-      emailAddress: bootstrap?.settings?.primaryContactEmail ?? "pki@azienda.local",
+      emailAddress: email,
       validityDays: 3650,
       pathLength: 1
     }
   });
+  const acmeForm = useForm<BootstrapAcmeForm>({
+    defaultValues: {
+      cloudflareApiToken: "",
+      directoryUrl: ACME_DIRECTORIES_BOOTSTRAP[0].value
+    }
+  });
+  const [caMode, setCaMode] = useState<"rootca" | "acme">("rootca");
   const [selectedInterfaces, setSelectedInterfaces] = useState<NetworkInterfaceConfig[]>([]);
 
   useEffect(() => {
-    if (!networkInterfaces) {
-      return;
-    }
+    if (org) caForm.setValue("organization", org);
+    if (org) caForm.setValue("commonName", `${org} Root CA`);
+    if (email) caForm.setValue("emailAddress", email);
+  }, [org, email]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!networkInterfaces) return;
     if (networkInterfaces.interfaces.length > 0) {
       setSelectedInterfaces(networkInterfaces.interfaces);
       return;
     }
-    const defaults = networkInterfaces.availableInterfaces.map((entry, index) => ({
+    setSelectedInterfaces(networkInterfaces.availableInterfaces.map((entry, index) => ({
       ...entry,
       enabled: index === 0,
       isDefault: index === 0
-    }));
-    setSelectedInterfaces(defaults);
+    })));
   }, [networkInterfaces]);
 
   const currentStep = !bootstrap?.steps.dnsConfigured
@@ -611,12 +662,12 @@ function BootstrapOverlay({
             Initial Bootstrap
           </div>
           <CardTitle>Complete DNS, PKI and network bootstrap</CardTitle>
-          <CardDescription>Finish the three required steps before publishing services: resolver config, root CA and machine interfaces.</CardDescription>
+          <CardDescription>Finish the three required steps before publishing services: resolver config, root CA or ACME, and machine interfaces.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div className="grid gap-4 md:grid-cols-3">
             <BootstrapStep title="1. DNS" done={bootstrap?.steps.dnsConfigured ?? false} />
-            <BootstrapStep title="2. Root CA" done={bootstrap?.steps.primaryCaConfigured ?? false} />
+            <BootstrapStep title="2. Certificates" done={bootstrap?.steps.primaryCaConfigured ?? false} />
             <BootstrapStep title="3. Interfaces" done={bootstrap?.steps.interfacesConfigured ?? false} />
           </div>
 
@@ -625,20 +676,18 @@ function BootstrapOverlay({
               <Field label="Organization">
                 <Input {...dnsForm.register("organizationName")} />
               </Field>
-              <Field label="Primary contact">
+              <Field label="Primary contact email">
                 <Input type="email" {...dnsForm.register("primaryContactEmail")} />
               </Field>
               <Field label="Default zone suffix">
                 <Input {...dnsForm.register("defaultZoneSuffix")} />
               </Field>
-              <Field label="DNS port">
+              <Field label="DNS listen port">
                 <Input type="number" {...dnsForm.register("dnsListenPort", { valueAsNumber: true })} />
               </Field>
               <Field label="Upstream mode">
                 <Select value={dnsForm.watch("upstreamMode")} onValueChange={(value: BootstrapForm["upstreamMode"]) => dnsForm.setValue("upstreamMode", value)}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="redundant">Redundant</SelectItem>
                     <SelectItem value="strict">Strict chain</SelectItem>
@@ -653,40 +702,90 @@ function BootstrapOverlay({
               </Field>
               {dnsError ? <p className="md:col-span-2 text-sm text-destructive">{dnsError}</p> : null}
               <div className="md:col-span-2 flex justify-end">
-                <Button type="submit" disabled={dnsLoading}>
-                  Save DNS settings
-                </Button>
+                <Button type="submit" disabled={dnsLoading}>Save DNS settings</Button>
               </div>
             </form>
           ) : null}
 
           {currentStep === "ca" ? (
-            <form className="grid gap-4 rounded-lg border border-border p-4 md:grid-cols-2" onSubmit={caForm.handleSubmit(onSubmitCa)}>
-              <Field label="CA name">
-                <Input {...caForm.register("name")} />
-              </Field>
-              <Field label="Common name">
-                <Input {...caForm.register("commonName")} />
-              </Field>
-              <Field label="Organization">
-                <Input {...caForm.register("organization")} />
-              </Field>
-              <Field label="Email">
-                <Input type="email" {...caForm.register("emailAddress")} />
-              </Field>
-              <Field label="Validity days">
-                <Input type="number" {...caForm.register("validityDays", { valueAsNumber: true })} />
-              </Field>
-              <Field label="Path length">
-                <Input type="number" {...caForm.register("pathLength", { valueAsNumber: true })} />
-              </Field>
-              {caError ? <p className="md:col-span-2 text-sm text-destructive">{caError}</p> : null}
-              <div className="md:col-span-2 flex justify-end">
-                <Button type="submit" disabled={caLoading}>
-                  Create root CA
-                </Button>
+            <div className="space-y-4 rounded-lg border border-border p-4">
+              <div className="grid gap-3 md:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setCaMode("rootca")}
+                  className={`rounded-lg border p-4 text-left transition-colors ${caMode === "rootca" ? "border-primary/40 bg-primary/10" : "border-border bg-background/30 hover:border-border/80"}`}
+                >
+                  <p className="font-medium text-sm">Local Root CA</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Create a self-signed root certificate authority for internal services. Fast, no external dependencies.</p>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCaMode("acme")}
+                  className={`rounded-lg border p-4 text-left transition-colors ${caMode === "acme" ? "border-primary/40 bg-primary/10" : "border-border bg-background/30 hover:border-border/80"}`}
+                >
+                  <p className="font-medium text-sm">ACME (Let's Encrypt / ZeroSSL)</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Issue publicly-trusted certificates via ACME DNS-01 challenge using a Cloudflare API token.</p>
+                </button>
               </div>
-            </form>
+
+              {caMode === "rootca" ? (
+                <form className="grid gap-4 md:grid-cols-2" onSubmit={caForm.handleSubmit(onSubmitCa)}>
+                  <Field label="CA name">
+                    <Input {...caForm.register("name")} />
+                  </Field>
+                  <Field label="Common name">
+                    <Input {...caForm.register("commonName")} />
+                  </Field>
+                  <Field label="Organization">
+                    <Input {...caForm.register("organization")} />
+                  </Field>
+                  <Field label="Email">
+                    <Input type="email" {...caForm.register("emailAddress")} />
+                  </Field>
+                  <Field label="Validity (days)">
+                    <Input type="number" {...caForm.register("validityDays", { valueAsNumber: true })} />
+                  </Field>
+                  <Field label="Path length">
+                    <Input type="number" {...caForm.register("pathLength", { valueAsNumber: true })} />
+                  </Field>
+                  {caError ? <p className="md:col-span-2 text-sm text-destructive">{caError}</p> : null}
+                  <div className="md:col-span-2 flex justify-end">
+                    <Button type="submit" disabled={caLoading}>Create root CA</Button>
+                  </div>
+                </form>
+              ) : (
+                <form className="grid gap-4 md:grid-cols-2" onSubmit={acmeForm.handleSubmit(onSubmitAcme)}>
+                  <Field label="ACME directory">
+                    <Select value={acmeForm.watch("directoryUrl")} onValueChange={(v) => acmeForm.setValue("directoryUrl", v)}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {ACME_DIRECTORIES_BOOTSTRAP.map((d) => (
+                          <SelectItem key={d.value} value={d.value}>{d.label}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field label="Contact email">
+                    <Input type="email" value={email} disabled className="opacity-60" />
+                  </Field>
+                  <div className="md:col-span-2 space-y-1.5">
+                    <Label>Cloudflare API token</Label>
+                    <Input
+                      type="password"
+                      placeholder="cf-token-…"
+                      {...acmeForm.register("cloudflareApiToken", { required: true })}
+                    />
+                    <p className="text-xs text-muted-foreground">Needs <code>Zone:DNS:Edit</code> permission. Used for DNS-01 challenge validation.</p>
+                  </div>
+                  {acmeError ? <p className="md:col-span-2 text-sm text-destructive">{acmeError}</p> : null}
+                  <div className="md:col-span-2 flex justify-end">
+                    <Button type="submit" disabled={acmeLoading}>
+                      {acmeLoading ? "Setting up ACME…" : "Set up ACME"}
+                    </Button>
+                  </div>
+                </form>
+              )}
+            </div>
           ) : null}
 
           {currentStep === "interfaces" ? (
@@ -726,10 +825,7 @@ function BootstrapOverlay({
                     variant={selectedInterfaces[index]?.isDefault ? "default" : "secondary"}
                     onClick={() =>
                       setSelectedInterfaces((current) =>
-                        current.map((item, itemIndex) => ({
-                          ...item,
-                          isDefault: itemIndex === index
-                        }))
+                        current.map((item, itemIndex) => ({ ...item, isDefault: itemIndex === index }))
                       )
                     }
                   >
@@ -776,7 +872,7 @@ function ZonesTable({
   error: string | null;
 }) {
   return (
-    <EntityTable
+    <SimpleTable
       headers={["Zone", "Type", "TTL", "State", "Actions"]}
       rows={zones.map((zone) => [
         zone.name,
@@ -923,7 +1019,7 @@ function UpstreamsTable({
   error: string | null;
 }) {
   return (
-    <EntityTable
+    <SimpleTable
       headers={["Resolver", "Endpoint", "Protocol", "Health", "Actions"]}
       rows={upstreams.map((upstream) => [
         upstream.name,
@@ -967,7 +1063,7 @@ function BlocklistTable({
   error: string | null;
 }) {
   return (
-    <EntityTable
+    <SimpleTable
       headers={["Pattern", "Kind", "Source", "State", "Actions"]}
       rows={entries.map((entry) => [
         <span key="pat" className="font-mono text-xs">{entry.pattern}</span>,
@@ -1057,35 +1153,6 @@ function RowActions({
   );
 }
 
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  valueLabel,
-  detail
-}: {
-  icon: typeof Globe;
-  label: string;
-  value?: number;
-  valueLabel?: string;
-  detail: string;
-}) {
-  return (
-    <Card className="bg-background/25">
-      <CardContent className="flex items-center justify-between p-5">
-        <div>
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="mt-2 text-3xl font-semibold">{valueLabel ?? value ?? 0}</p>
-          <p className="mt-1 text-xs uppercase tracking-[0.12em] text-primary">{detail}</p>
-        </div>
-        <div className="rounded-md border border-primary/20 bg-primary/10 p-3">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function InventoryCard({
   title,
   description,
@@ -1119,7 +1186,7 @@ function ZoneFormDialog({
   initialValues?: ZoneForm;
   submitLabel?: string;
 }) {
-  const { register, handleSubmit, watch, setValue, reset } = useForm<ZoneForm>({
+  const { register, handleSubmit, watch, setValue, reset, formState: { errors } } = useForm<ZoneForm>({
     defaultValues: initialValues ?? {
       name: "apps.azienda.local",
       kind: "local",
@@ -1146,8 +1213,8 @@ function ZoneFormDialog({
       error={error}
       submitLabel={submitLabel}
     >
-      <Field label="Zone name">
-        <Input {...register("name")} />
+      <Field label="Zone name" error={errors.name?.message}>
+        <Input {...register("name", { required: "Zone name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, pattern: { value: /^[a-zA-Z0-9.-]+$/, message: "Only letters, digits, dots and hyphens allowed" } })} />
       </Field>
       <Field label="Type">
         <Select value={watch("kind")} onValueChange={(value: ZoneForm["kind"]) => setValue("kind", value)}>
@@ -1160,11 +1227,11 @@ function ZoneFormDialog({
           </SelectContent>
         </Select>
       </Field>
-      <Field label="Description">
-        <Input {...register("description")} />
+      <Field label="Description" error={errors.description?.message}>
+        <Input {...register("description", { maxLength: { value: 280, message: "Max 280 characters" } })} />
       </Field>
-      <Field label="TTL">
-        <Input type="number" {...register("ttl", { valueAsNumber: true })} />
+      <Field label="TTL" error={errors.ttl?.message}>
+        <Input type="number" {...register("ttl", { valueAsNumber: true, min: { value: 60, message: "Minimum TTL is 60 seconds" }, max: { value: 86400, message: "Maximum TTL is 86400 seconds" } })} />
       </Field>
       <ToggleRow label="Primary" checked={watch("isPrimary")} onChange={(value) => setValue("isPrimary", value)} />
       <ToggleRow label="Reverse zone" checked={watch("isReverse")} onChange={(value) => setValue("isReverse", value)} />
@@ -1189,15 +1256,15 @@ function RecordFormDialog({
   submitLabel?: string;
 }) {
   const firstZoneId = zones[0]?.id ?? 0;
-  const { register, handleSubmit, watch, setValue, reset } = useForm<RecordForm>({
+  const { register, handleSubmit, watch, setValue, reset, formState: { errors } } = useForm<RecordForm>({
     defaultValues: initialValues ?? {
       zoneId: firstZoneId,
-      name: "grafana",
+      name: "",
       type: "A",
-      value: "10.0.0.15",
+      value: "",
       ttl: 300,
       priority: null,
-      proxiedService: "monitoring/grafana",
+      proxiedService: "",
       enabled: true
     }
   });
@@ -1231,8 +1298,8 @@ function RecordFormDialog({
           </SelectContent>
         </Select>
       </Field>
-      <Field label="Host">
-        <Input {...register("name")} />
+      <Field label="Host" error={errors.name?.message}>
+        <Input {...register("name", { required: "Host is required", minLength: { value: 1, message: "Host cannot be empty" }, maxLength: { value: 255, message: "Max 255 characters" } })} />
       </Field>
       <Field label="Type">
         <Select value={watch("type")} onValueChange={(value: RecordForm["type"]) => setValue("type", value)}>
@@ -1248,17 +1315,17 @@ function RecordFormDialog({
           </SelectContent>
         </Select>
       </Field>
-      <Field label="Value">
-        <Input {...register("value")} />
+      <Field label="Value" error={errors.value?.message}>
+        <Input {...register("value", { required: "Value is required", minLength: { value: 1, message: "Value cannot be empty" } })} />
       </Field>
-      <Field label="TTL">
-        <Input type="number" {...register("ttl", { valueAsNumber: true })} />
+      <Field label="TTL" error={errors.ttl?.message}>
+        <Input type="number" {...register("ttl", { valueAsNumber: true, min: { value: 60, message: "Minimum TTL is 60 seconds" }, max: { value: 86400, message: "Maximum TTL is 86400 seconds" } })} />
       </Field>
-      <Field label="Priority">
+      <Field label="Priority" error={errors.priority?.message}>
         <Input type="number" {...register("priority", { setValueAs: (value) => (value === "" ? null : Number(value)) })} />
       </Field>
-      <Field label="Mapped service">
-        <Input {...register("proxiedService")} />
+      <Field label="Mapped service" error={errors.proxiedService?.message}>
+        <Input {...register("proxiedService", { maxLength: { value: 120, message: "Max 120 characters" } })} />
       </Field>
       <ToggleRow label="Enabled" checked={watch("enabled")} onChange={(value) => setValue("enabled", value)} />
     </DialogForm>
@@ -1278,10 +1345,10 @@ function UpstreamFormDialog({
   initialValues?: UpstreamForm;
   submitLabel?: string;
 }) {
-  const { register, handleSubmit, watch, setValue, reset } = useForm<UpstreamForm>({
+  const { register, handleSubmit, watch, setValue, reset, formState: { errors } } = useForm<UpstreamForm>({
     defaultValues: initialValues ?? {
-      name: "Cloudflare",
-      address: "1.1.1.1",
+      name: "",
+      address: "",
       port: 53,
       protocol: "udp",
       enabled: true,
@@ -1304,14 +1371,14 @@ function UpstreamFormDialog({
       error={error}
       submitLabel={submitLabel}
     >
-      <Field label="Name">
-        <Input {...register("name")} />
+      <Field label="Name" error={errors.name?.message}>
+        <Input {...register("name", { required: "Name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
       </Field>
-      <Field label="Address">
-        <Input {...register("address")} />
+      <Field label="Address" error={errors.address?.message}>
+        <Input {...register("address", { required: "Address is required", minLength: { value: 3, message: "Enter a valid IP or hostname" } })} />
       </Field>
-      <Field label="Port">
-        <Input type="number" {...register("port", { valueAsNumber: true })} />
+      <Field label="Port" error={errors.port?.message}>
+        <Input type="number" {...register("port", { valueAsNumber: true, required: "Port is required", min: { value: 1, message: "Port must be between 1 and 65535" }, max: { value: 65535, message: "Port must be between 1 and 65535" } })} />
       </Field>
       <Field label="Protocol">
         <Select value={watch("protocol")} onValueChange={(value: UpstreamForm["protocol"]) => setValue("protocol", value)}>
@@ -1327,8 +1394,8 @@ function UpstreamFormDialog({
           </SelectContent>
         </Select>
       </Field>
-      <Field label="Priority">
-        <Input type="number" {...register("priority", { valueAsNumber: true })} />
+      <Field label="Priority" error={errors.priority?.message}>
+        <Input type="number" {...register("priority", { valueAsNumber: true, min: { value: 1, message: "Priority must be between 1 and 999" }, max: { value: 999, message: "Priority must be between 1 and 999" } })} />
       </Field>
       <ToggleRow label="Enabled" checked={watch("enabled")} onChange={(value) => setValue("enabled", value)} />
     </DialogForm>
@@ -1348,11 +1415,11 @@ function BlocklistFormDialog({
   initialValues?: BlocklistForm;
   submitLabel?: string;
 }) {
-  const { register, handleSubmit, watch, setValue, reset } = useForm<BlocklistForm>({
+  const { register, handleSubmit, watch, setValue, reset, formState: { errors } } = useForm<BlocklistForm>({
     defaultValues: initialValues ?? {
-      pattern: "ads.example.com",
+      pattern: "",
       kind: "domain",
-      source: "manual",
+      source: "",
       enabled: true
     }
   });
@@ -1372,8 +1439,8 @@ function BlocklistFormDialog({
       error={error}
       submitLabel={submitLabel}
     >
-      <Field label="Pattern">
-        <Input {...register("pattern")} />
+      <Field label="Pattern" error={errors.pattern?.message}>
+        <Input {...register("pattern", { required: "Pattern is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 1024, message: "Max 1024 characters" } })} />
       </Field>
       <Field label="Kind">
         <Select value={watch("kind")} onValueChange={(value: BlocklistForm["kind"]) => setValue("kind", value)}>
@@ -1387,8 +1454,8 @@ function BlocklistFormDialog({
           </SelectContent>
         </Select>
       </Field>
-      <Field label="Source">
-        <Input {...register("source")} />
+      <Field label="Source" error={errors.source?.message}>
+        <Input {...register("source", { maxLength: { value: 255, message: "Max 255 characters" } })} />
       </Field>
       <ToggleRow label="Enabled" checked={watch("enabled")} onChange={(value) => setValue("enabled", value)} />
     </DialogForm>
@@ -1430,72 +1497,11 @@ function DialogForm({
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="space-y-2">
-      <Label>{label}</Label>
-      {children}
-    </div>
-  );
-}
-
 function ToggleRow({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) {
   return (
     <div className="flex items-center justify-between rounded-md border border-input bg-secondary/40 px-3 py-2">
       <span className="text-sm text-muted-foreground">{label}</span>
       <Switch checked={checked} onCheckedChange={onChange} />
-    </div>
-  );
-}
-
-function EntityTable({ headers, rows }: { headers: string[]; rows: Array<Array<React.ReactNode>> }) {
-  return <SimpleTable headers={headers} rows={rows} alignLastRight />;
-}
-
-function SimpleTable({
-  headers,
-  rows,
-  alignLastRight = false
-}: {
-  headers: string[];
-  rows: Array<Array<React.ReactNode>>;
-  alignLastRight?: boolean;
-}) {
-  return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <table className="w-full text-left text-sm">
-        <thead className="bg-secondary/60 text-muted-foreground">
-          <tr>
-            {headers.map((header, index) => (
-              <th key={header} className={`px-4 py-3 font-medium ${alignLastRight && index === headers.length - 1 ? "text-right" : ""}`}>
-                {header}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={headers.length} className="px-4 py-8 text-center text-muted-foreground">
-                No data yet.
-              </td>
-            </tr>
-          ) : (
-            rows.map((row, rowIndex) => (
-              <tr key={rowIndex} className="border-t border-border/80">
-                {row.map((cell, cellIndex) => (
-                  <td
-                    key={`${rowIndex}-${cellIndex}`}
-                    className={`px-4 py-3 align-top ${alignLastRight && cellIndex === row.length - 1 ? "text-right" : ""}`}
-                  >
-                    {cell}
-                  </td>
-                ))}
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
     </div>
   );
 }

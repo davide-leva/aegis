@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ArrowRight, Boxes, Link2, Network, Pencil, Plus, RefreshCcw, Server, Trash2, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Boxes, Link2, Network, Pencil, Plus, RefreshCcw, Server } from "lucide-react";
 import { Link, Route, Routes, useNavigate, useParams } from "react-router-dom";
 
 import { AppShell } from "@/components/layout/app-shell";
@@ -9,6 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import type { BadgeVariant } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DataTable } from "@/components/ui/data-table";
+import { DeleteDialog } from "@/components/ui/delete-dialog";
 import {
   Dialog,
   DialogClose,
@@ -19,13 +21,16 @@ import {
   DialogTitle,
   DialogTrigger
 } from "@/components/ui/dialog";
+import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { MetricCard } from "@/components/ui/metric-card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { formatEventPayload } from "@/lib/event-format";
+import { formatTimestamp } from "@/lib/format";
 
 const HTTP_LISTENER = { address: "0.0.0.0", port: 80 };
 const HTTPS_LISTENER = { address: "0.0.0.0", port: 443 };
@@ -198,6 +203,7 @@ export function DockerPage() {
     <Routes>
       <Route path="/" element={<DockerWorkspace />} />
       <Route path=":environmentId" element={<DockerWorkspace />} />
+      <Route path=":environmentId/:containerId" element={<DockerWorkspace />} />
     </Routes>
   );
 }
@@ -206,7 +212,6 @@ function DockerWorkspace() {
   const params = useParams();
   const navigate = useNavigate();
   const [refreshNonce, setRefreshNonce] = useState(0);
-  const [selectedContainerId, setSelectedContainerId] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const selectedEnvironmentId = useMemo(() => {
@@ -214,9 +219,7 @@ function DockerWorkspace() {
     return Number.isFinite(fromRoute) ? fromRoute : 0;
   }, [params.environmentId]);
 
-  useEffect(() => {
-    setSelectedContainerId(null);
-  }, [selectedEnvironmentId]);
+  const selectedContainerId = params.containerId ?? null;
 
   const dashboard = useQuery({
     queryKey: ["docker-dashboard"],
@@ -312,16 +315,30 @@ function DockerWorkspace() {
 
   const data = dashboard.data;
   const selectedEnvironment = data.environments.find((item) => item.id === selectedEnvironmentId) ?? null;
-  const hasEnvironmentRoute = Boolean(params.environmentId);
-  const viewMode = hasEnvironmentRoute ? "containers" : "environments";
-  const primaryTitle = viewMode === "environments" ? "Docker environments" : "Containers";
+  const viewMode = selectedContainerId ? "container" : params.environmentId ? "containers" : "environments";
+  const primaryTitle =
+    viewMode === "environments" ? "Docker environments"
+    : viewMode === "container" ? (containerDetail.data?.name ?? "Container")
+    : "Containers";
   const primaryDescription =
     viewMode === "environments"
       ? "Socket-local and remote engines registered in Aegis, with quick container health counts."
-      : selectedEnvironment
-        ? `Containers discovered on ${selectedEnvironment.name}. Click a container to inspect and map its ports.`
-        : "The selected environment could not be found.";
-  const backTarget = viewMode === "containers" ? "/docker" : null;
+      : viewMode === "container"
+        ? containerDetail.data
+          ? `${containerDetail.data.image} · started ${formatTimestamp(containerDetail.data.startedAt)}`
+          : "Loading container details…"
+        : selectedEnvironment
+          ? `Containers discovered on ${selectedEnvironment.name}. Click a container to inspect and map its ports.`
+          : "The selected environment could not be found.";
+  const backTarget =
+    viewMode === "container" ? `/docker/${selectedEnvironmentId}`
+    : viewMode === "containers" ? "/docker"
+    : null;
+  const breadcrumbItems = [
+    { label: "Docker", to: "/docker" },
+    ...(selectedEnvironment ? [{ label: selectedEnvironment.name, to: `/docker/${selectedEnvironment.id}` }] : []),
+    ...(viewMode === "container" && containerDetail.data ? [{ label: containerDetail.data.name }] : [])
+  ];
 
   return (
     <AppShell
@@ -365,17 +382,12 @@ function DockerWorkspace() {
       <div className="space-y-6">
         <Card className="bg-background/20">
           <CardHeader>
-            <CardTopNav
-              backTarget={backTarget}
-              items={[
-                { label: "Docker", to: "/docker" },
-                ...(selectedEnvironment ? [{ label: selectedEnvironment.name, to: `/docker/${selectedEnvironment.id}` }] : [])
-              ]}
-            />
+            <CardTopNav backTarget={backTarget} items={breadcrumbItems} />
             <CardTitle>{primaryTitle}</CardTitle>
             <CardDescription>{primaryDescription}</CardDescription>
           </CardHeader>
           <CardContent>
+            {/* ── Level 1: environments list ── */}
             {viewMode === "environments" ? (
               <div className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-3">
                 {data.environments.length === 0 ? (
@@ -388,12 +400,7 @@ function DockerWorkspace() {
                     return (
                       <div
                         key={environment.id}
-                        className={cn(
-                          "rounded-lg border p-4 transition-all",
-                          selectedEnvironmentId === environment.id
-                            ? "border-primary/40 bg-primary/5"
-                            : "border-border bg-background/30"
-                        )}
+                        className="rounded-lg border border-border bg-background/30 p-4 transition-all"
                       >
                         <div className="flex items-start justify-between gap-3">
                           <button className="min-w-0 flex-1 text-left" onClick={() => navigate(`/docker/${environment.id}`)}>
@@ -404,9 +411,7 @@ function DockerWorkspace() {
                               <Badge variant="default">{labelConnectionType(environment)}</Badge>
                             </div>
                             <p className="text-sm font-semibold text-foreground">{environment.name}</p>
-                            <p className="mt-1 text-xs text-muted-foreground">
-                              {labelConnection(environment)}
-                            </p>
+                            <p className="mt-1 text-xs text-muted-foreground">{labelConnection(environment)}</p>
                             <p className="mt-0.5 text-xs text-muted-foreground">
                               Public IP: <span className="font-mono">{environment.publicIp}</span>
                             </p>
@@ -469,9 +474,7 @@ function DockerWorkspace() {
                           </div>
                         )}
 
-                        {stats?.error ? (
-                          <p className="mt-3 text-xs text-destructive">{stats.error}</p>
-                        ) : null}
+                        {stats?.error ? <p className="mt-3 text-xs text-destructive">{stats.error}</p> : null}
                         {environment.enabled && !stats?.error ? (
                           <EnvironmentResourceStatsRow environmentId={environment.id} />
                         ) : null}
@@ -480,256 +483,210 @@ function DockerWorkspace() {
                   })
                 )}
               </div>
-            ) : selectedEnvironment ? (
-              <div className="space-y-4">
-                {containers.isLoading ? (
-                  <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
-                    Loading containers...
-                  </p>
-                ) : (containers.data ?? []).length === 0 ? (
-                  <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
-                    No containers found on this environment.
-                  </p>
-                ) : (
-                  <>
-                    <ContainerStatsBar containers={containers.data ?? []} />
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-                      {(containers.data ?? []).map((container) => (
-                        <ContainerCard
-                          key={container.id}
-                          container={container}
-                          selected={selectedContainerId === container.id}
-                          onClick={() =>
-                            setSelectedContainerId((prev) => (prev === container.id ? null : container.id))
-                          }
-                        />
-                      ))}
-                    </div>
-                  </>
-                )}
+            ) : null}
 
-                {selectedContainerId ? (
-                  <div className="rounded-lg border border-primary/30 bg-primary/3 p-5">
-                    <div className="mb-5 flex items-start justify-between gap-4">
-                      <div className="min-w-0">
-                        {containerDetail.data ? (
-                          <>
-                            <div className="flex flex-wrap items-center gap-2">
-                              <StateBadge state={containerDetail.data.state} />
-                              {containerDetail.data.pid > 0 && (
-                                <span className="font-mono text-xs text-muted-foreground">PID {containerDetail.data.pid}</span>
-                              )}
-                              {containerDetail.data.restartCount > 0 && (
-                                <Badge variant="warning">{containerDetail.data.restartCount} restart{containerDetail.data.restartCount !== 1 ? "s" : ""}</Badge>
-                              )}
-                            </div>
-                            <h3 className="mt-2 text-sm font-semibold text-foreground">{containerDetail.data.name}</h3>
-                            <p className="text-xs text-muted-foreground">{containerDetail.data.image}</p>
-                            {containerDetail.data.startedAt && (
-                              <p className="mt-1 text-xs text-muted-foreground">
-                                Started {formatTimestamp(containerDetail.data.startedAt)}
-                                {containerDetail.data.finishedAt ? ` · Finished ${formatTimestamp(containerDetail.data.finishedAt)}` : ""}
-                              </p>
-                            )}
-                          </>
-                        ) : containerDetail.isLoading ? (
-                          <p className="text-sm text-muted-foreground">Loading container details…</p>
-                        ) : (
-                          <p className="text-sm text-destructive">Failed to load container details.</p>
-                        )}
+            {/* ── Level 2: containers grid ── */}
+            {viewMode === "containers" ? (
+              selectedEnvironment ? (
+                <div className="space-y-4">
+                  {containers.isLoading ? (
+                    <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
+                      Loading containers...
+                    </p>
+                  ) : (containers.data ?? []).length === 0 ? (
+                    <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
+                      No containers found on this environment.
+                    </p>
+                  ) : (
+                    <>
+                      <ContainerStatsBar containers={containers.data ?? []} />
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+                        {(containers.data ?? []).map((container) => (
+                          <ContainerCard
+                            key={container.id}
+                            container={container}
+                            onClick={() => navigate(`/docker/${selectedEnvironment.id}/${container.id}`)}
+                          />
+                        ))}
                       </div>
-                      <Button variant="ghost" className="h-9 w-9 shrink-0 p-0" onClick={() => setSelectedContainerId(null)}>
-                        <X className="h-4 w-4" />
+                    </>
+                  )}
+                </div>
+              ) : (
+                <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
+                  The selected environment no longer exists.
+                </p>
+              )
+            ) : null}
+
+            {/* ── Level 3: container detail ── */}
+            {viewMode === "container" ? (
+              containerDetail.isLoading ? (
+                <p className="py-10 text-center text-sm text-muted-foreground">Loading container details…</p>
+              ) : containerDetail.data ? (
+                <div className="space-y-6">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <StateBadge state={containerDetail.data.state} />
+                    {containerDetail.data.pid > 0 && (
+                      <span className="font-mono text-xs text-muted-foreground">PID {containerDetail.data.pid}</span>
+                    )}
+                    {containerDetail.data.restartCount > 0 && (
+                      <Badge variant="warning">{containerDetail.data.restartCount} restart{containerDetail.data.restartCount !== 1 ? "s" : ""}</Badge>
+                    )}
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+                    <MiniStat label="Mappings" value={String(containerDetail.data.mappings.length)} />
+                    <MiniStat label="Public IP" value={containerDetail.data.environment.publicIp} />
+                    <MiniStat label="Status" value={containerDetail.data.status} />
+                    <MiniStat label="Restart policy" value={containerDetail.data.restartPolicy} />
+                    <MiniStat
+                      label="Memory limit"
+                      value={containerDetail.data.memoryLimitBytes > 0 ? formatBytes(containerDetail.data.memoryLimitBytes) : "No limit"}
+                    />
+                    <MiniStat label="Networks" value={String(containerDetail.data.networks.length || containerDetail.data.networkIps.length)} />
+                  </div>
+
+                  {containerDetail.data.networks.length > 0 && (
+                    <div>
+                      <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Networks</h4>
+                      <div className="flex flex-wrap gap-2">
+                        {containerDetail.data.networks.map((net) => (
+                          <div key={net.name} className="flex items-center gap-1.5 rounded border border-border bg-background/60 px-2.5 py-1.5">
+                            <span className="text-[11px] font-medium text-foreground">{net.name}</span>
+                            <span className="font-mono text-[10px] text-muted-foreground">{net.ip}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {Object.keys(containerDetail.data.labels).filter((k) => k.startsWith("aegis.")).length > 0 && (
+                    <div>
+                      <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Aegis Labels</h4>
+                      <div className="flex flex-wrap gap-2">
+                        {Object.entries(containerDetail.data.labels)
+                          .filter(([k]) => k.startsWith("aegis."))
+                          .map(([k, v]) => (
+                            <div key={k} className="rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px]">
+                              <span className="text-primary">{k}</span>
+                              <span className="text-muted-foreground"> = </span>
+                              <span className="text-foreground">{v}</span>
+                            </div>
+                          ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="rounded-md border border-border bg-background/30 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-sm font-semibold text-foreground">Automap labels</h3>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Detected <code className="font-mono">aegis.*</code> labels generate DNS, proxy routes and HTTPS certificates automatically.
+                        </p>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={autoMapMutation.isPending || containerDetail.data.automapCandidates.filter((c) => !c.alreadyMapped).length === 0}
+                        onClick={() => autoMapMutation.mutate({ environmentId: selectedEnvironmentId, containerId: containerDetail.data!.id })}
+                      >
+                        Retry automap
                       </Button>
                     </div>
-
-                    {containerDetail.data && (
-                      <div className="space-y-6">
-                        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
-                          <MiniStat label="Mappings" value={String(containerDetail.data.mappings.length)} />
-                          <MiniStat label="Public IP" value={containerDetail.data.environment.publicIp} />
-                          <MiniStat label="Status" value={containerDetail.data.status} />
-                          <MiniStat label="Restart policy" value={containerDetail.data.restartPolicy} />
-                          <MiniStat
-                            label="Memory limit"
-                            value={containerDetail.data.memoryLimitBytes > 0 ? formatBytes(containerDetail.data.memoryLimitBytes) : "No limit"}
-                          />
-                          <MiniStat label="Networks" value={String(containerDetail.data.networks.length || containerDetail.data.networkIps.length)} />
-                        </div>
-
-                        {containerDetail.data.networks.length > 0 && (
-                          <div>
-                            <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Networks</h4>
-                            <div className="flex flex-wrap gap-2">
-                              {containerDetail.data.networks.map((net) => (
-                                <div key={net.name} className="flex items-center gap-1.5 rounded border border-border bg-background/60 px-2.5 py-1.5">
-                                  <span className="text-[11px] font-medium text-foreground">{net.name}</span>
-                                  <span className="font-mono text-[10px] text-muted-foreground">{net.ip}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-
-                        {Object.keys(containerDetail.data.labels).filter((k) => k.startsWith("aegis.")).length > 0 && (
-                          <div>
-                            <h4 className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">Aegis Labels</h4>
-                            <div className="flex flex-wrap gap-2">
-                              {Object.entries(containerDetail.data.labels)
-                                .filter(([k]) => k.startsWith("aegis."))
-                                .map(([k, v]) => (
-                                  <div key={k} className="rounded border border-border bg-background/60 px-2 py-1 font-mono text-[11px]">
-                                    <span className="text-primary">{k}</span>
-                                    <span className="text-muted-foreground"> = </span>
-                                    <span className="text-foreground">{v}</span>
-                                  </div>
-                                ))}
-                            </div>
-                          </div>
-                        )}
-
-                        <div className="rounded-md border border-border bg-background/30 p-4">
-                          <div className="flex flex-wrap items-center justify-between gap-3">
-                            <div>
-                              <h3 className="text-sm font-semibold text-foreground">Automap labels</h3>
-                              <p className="mt-1 text-xs text-muted-foreground">
-                                Detected <code className="font-mono">aegis.*</code> labels can generate DNS, proxy routes and HTTPS certificates automatically.
-                              </p>
-                            </div>
-                            <Button
-                              variant="secondary"
-                              size="sm"
-                              disabled={
-                                autoMapMutation.isPending ||
-                                containerDetail.data.automapCandidates.filter((item) => !item.alreadyMapped).length === 0
-                              }
-                              onClick={() =>
-                                autoMapMutation.mutate({
-                                  environmentId: selectedEnvironment.id,
-                                  containerId: containerDetail.data!.id
-                                })
-                              }
-                            >
-                              Retry automap
-                            </Button>
-                          </div>
-                          <div className="mt-4">
-                            <DataTable
-                              headers={["Service", "Host", "Route", "Container port", "Status"]}
-                              rows={
-                                containerDetail.data.automapCandidates.length
-                                  ? containerDetail.data.automapCandidates.map((candidate) => [
-                                      candidate.service,
-                                      candidate.dnsName,
-                                      `${candidate.routeProtocol.toUpperCase()} → ${candidate.listenPort}`,
-                                      `${candidate.privatePort}/${candidate.protocol}${candidate.publicPort ? ` → ${candidate.publicPort}` : ""}`,
-                                      candidate.alreadyMapped ? (
-                                        <Badge key="mapped" variant="success">
-                                          {candidate.existingRouteName ? candidate.existingRouteName : "Mapped"}
-                                        </Badge>
-                                      ) : (
-                                        <Badge key="ready" variant="default">Ready</Badge>
-                                      )
-                                    ])
-                                  : [["-", "No aegis labels detected", "-", "-", "-"]]
-                              }
-                            />
-                          </div>
-                          {containerDetail.data.automapIssues.length ? (
-                            <div className="mt-4">
-                              <h4 className="mb-3 text-sm font-semibold text-foreground">Automap issues</h4>
-                              <DataTable
-                                headers={["Service", "Problem", "Labels", "Severity"]}
-                                rows={containerDetail.data.automapIssues.map((issue) => [
-                                  issue.service,
-                                  issue.message,
-                                  issue.labels.join(", "),
-                                  <Badge key="sev" variant="danger">{issue.severity}</Badge>
-                                ])}
-                              />
-                            </div>
-                          ) : null}
-                          {containerDetail.data.automapEvents.length ? (
-                            <div className="mt-4">
-                              <h4 className="mb-3 text-sm font-semibold text-foreground">Recent automap events</h4>
-                              <DataTable
-                                headers={["Time", "Topic", "Payload"]}
-                                rows={containerDetail.data.automapEvents.map((event) => [
-                                  formatTimestamp(event.createdAt),
-                                  event.topic,
-                                  compactJson(event.payload)
-                                ])}
-                              />
-                            </div>
-                          ) : null}
-                        </div>
-
-                        <div>
-                          <h3 className="mb-3 text-sm font-semibold text-foreground">Exposed ports</h3>
-                          {containerDetail.data.exposedPorts.length === 0 ? (
-                            <p className="rounded-md border border-dashed border-border px-4 py-8 text-sm text-muted-foreground">
-                              No ports exposed by this container.
-                            </p>
-                          ) : (
-                            <DataTable
-                              headers={["Port", "Published bindings", "Aegis mapping", "Action"]}
-                              rows={containerDetail.data.exposedPorts.map((port) => {
-                                const existing = containerDetail.data!.mappings.filter(
-                                  (mapping) => mapping.privatePort === port.privatePort && mapping.protocol === port.protocol
-                                );
-                                return [
-                                  <span key="port" className="font-mono text-sm">
-                                    {port.privatePort}/{port.protocol}
-                                  </span>,
-                                  port.publishedBindings.length
-                                    ? port.publishedBindings
-                                        .map((b) => `${b.hostIp ?? "*"}:${b.publicPort}`)
-                                        .join(", ")
-                                    : <span className="text-muted-foreground">Direct container only</span>,
-                                  existing.length ? (
-                                    <div key="mappings" className="flex flex-wrap gap-1">
-                                      {existing.map((m) => (
-                                        <Badge key={m.id} variant="success">
-                                          {m.proxyRouteName ?? `Route ${m.proxyRouteId}`}
-                                        </Badge>
-                                      ))}
-                                    </div>
-                                  ) : (
-                                    <Badge key="unmapped" variant="muted">Not mapped</Badge>
-                                  ),
-                                  <PortMappingDialog
-                                    key={`${port.privatePort}-${port.protocol}`}
-                                    container={containerDetail.data!}
-                                    port={port}
-                                    loading={createMappingMutation.isPending}
-                                    error={dialogError}
-                                    onSubmit={(values) =>
-                                      createMappingMutation.mutate({
-                                        environmentId: selectedEnvironment.id,
-                                        containerId: containerDetail.data!.id,
-                                        privatePort: port.privatePort,
-                                        publicPort: port.publishedBindings[0]?.publicPort ?? null,
-                                        protocol: port.protocol,
-                                        ...normalizeMappingForm(values)
-                                      })
-                                    }
-                                    networkInterfaces={networkInterfaces.data?.interfaces ?? []}
-                                  />
-                                ];
-                              })}
-                            />
-                          )}
-                        </div>
+                    <div className="mt-4">
+                      <DataTable
+                        headers={["Service", "Host", "Route", "Container port", "Status"]}
+                        rows={
+                          containerDetail.data.automapCandidates.length
+                            ? containerDetail.data.automapCandidates.map((c) => [
+                                c.service,
+                                c.dnsName,
+                                `${c.routeProtocol.toUpperCase()} → ${c.listenPort}`,
+                                `${c.privatePort}/${c.protocol}${c.publicPort ? ` → ${c.publicPort}` : ""}`,
+                                c.alreadyMapped
+                                  ? <Badge key="mapped" variant="success">{c.existingRouteName ?? "Mapped"}</Badge>
+                                  : <Badge key="ready" variant="default">Ready</Badge>
+                              ])
+                            : [["-", "No aegis labels detected", "-", "-", "-"]]
+                        }
+                      />
+                    </div>
+                    {containerDetail.data.automapIssues.length > 0 && (
+                      <div className="mt-4">
+                        <h4 className="mb-3 text-sm font-semibold text-foreground">Automap issues</h4>
+                        <DataTable
+                          headers={["Service", "Problem", "Labels", "Severity"]}
+                          rows={containerDetail.data.automapIssues.map((issue) => [
+                            issue.service, issue.message, issue.labels.join(", "),
+                            <Badge key="sev" variant="danger">{issue.severity}</Badge>
+                          ])}
+                        />
+                      </div>
+                    )}
+                    {containerDetail.data.automapEvents.length > 0 && (
+                      <div className="mt-4">
+                        <h4 className="mb-3 text-sm font-semibold text-foreground">Recent automap events</h4>
+                        <DataTable
+                          headers={["Time", "Topic", "Payload"]}
+                          rows={containerDetail.data.automapEvents.map((event) => [
+                            formatTimestamp(event.createdAt), event.topic, compactJson(event.payload)
+                          ])}
+                        />
                       </div>
                     )}
                   </div>
-                ) : null}
-              </div>
-            ) : (
-              <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">
-                The selected environment no longer exists. Go back to the environments list.
-              </p>
-            )}
+
+                  <div>
+                    <h3 className="mb-3 text-sm font-semibold text-foreground">Exposed ports</h3>
+                    {containerDetail.data.exposedPorts.length === 0 ? (
+                      <p className="rounded-md border border-dashed border-border px-4 py-8 text-sm text-muted-foreground">
+                        No ports exposed by this container.
+                      </p>
+                    ) : (
+                      <DataTable
+                        headers={["Port", "Published bindings", "Aegis mapping", "Action"]}
+                        rows={containerDetail.data.exposedPorts.map((port) => {
+                          const existing = containerDetail.data!.mappings.filter(
+                            (m) => m.privatePort === port.privatePort && m.protocol === port.protocol
+                          );
+                          return [
+                            <span key="port" className="font-mono text-sm">{port.privatePort}/{port.protocol}</span>,
+                            port.publishedBindings.length
+                              ? port.publishedBindings.map((b) => `${b.hostIp ?? "*"}:${b.publicPort}`).join(", ")
+                              : <span className="text-muted-foreground">Direct container only</span>,
+                            existing.length
+                              ? <div key="m" className="flex flex-wrap gap-1">{existing.map((m) => <Badge key={m.id} variant="success">{m.proxyRouteName ?? `Route ${m.proxyRouteId}`}</Badge>)}</div>
+                              : <Badge key="u" variant="muted">Not mapped</Badge>,
+                            <PortMappingDialog
+                              key={`${port.privatePort}-${port.protocol}`}
+                              container={containerDetail.data!}
+                              port={port}
+                              loading={createMappingMutation.isPending}
+                              error={dialogError}
+                              onSubmit={(values) =>
+                                createMappingMutation.mutate({
+                                  environmentId: selectedEnvironmentId,
+                                  containerId: containerDetail.data!.id,
+                                  privatePort: port.privatePort,
+                                  publicPort: port.publishedBindings[0]?.publicPort ?? null,
+                                  protocol: port.protocol,
+                                  ...normalizeMappingForm(values)
+                                })
+                              }
+                              networkInterfaces={networkInterfaces.data?.interfaces ?? []}
+                            />
+                          ];
+                        })}
+                      />
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <p className="py-10 text-center text-sm text-destructive">Failed to load container details.</p>
+              )
+            ) : null}
           </CardContent>
         </Card>
       </div>
@@ -739,11 +696,9 @@ function DockerWorkspace() {
 
 function ContainerCard({
   container,
-  selected,
   onClick
 }: {
   container: DockerContainerListItem;
-  selected: boolean;
   onClick: () => void;
 }) {
   const hasAegisLabels = Object.keys(container.labels ?? {}).some((k) => k.startsWith("aegis."));
@@ -756,12 +711,7 @@ function ContainerCard({
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") onClick();
       }}
-      className={cn(
-        "cursor-pointer rounded-lg border p-4 text-left transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40",
-        selected
-          ? "border-primary/40 bg-primary/5 ring-1 ring-primary/10"
-          : "border-border bg-background/30 hover:border-border/80 hover:bg-background/40"
-      )}
+      className="cursor-pointer rounded-lg border border-border bg-background/30 p-4 text-left transition-all hover:border-primary/30 hover:bg-background/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
     >
       <div className="flex items-start justify-between gap-2">
         <StateBadge state={container.state} />
@@ -798,12 +748,6 @@ function ContainerCard({
         <p className="mt-3 text-[11px] text-muted-foreground/60">No published ports</p>
       )}
 
-      {selected && (
-        <div className="mt-3 flex items-center gap-1 text-[11px] text-primary">
-          <span>Details below</span>
-          <ArrowRight className="h-3 w-3 rotate-90" />
-        </div>
-      )}
     </div>
   );
 }
@@ -890,7 +834,7 @@ function EnvironmentDialog({
   trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const { register, handleSubmit, watch, setValue } = useForm<EnvironmentForm>({
+  const { register, handleSubmit, watch, setValue, formState: { errors: envErrors } } = useForm<EnvironmentForm>({
     defaultValues:
       initialValues ??
       ({
@@ -924,8 +868,8 @@ function EnvironmentDialog({
             setOpen(false);
           })}
         >
-          <Field label="Name">
-            <Input {...register("name")} />
+          <Field label="Name" error={envErrors.name?.message}>
+            <Input {...register("name", { required: "Environment name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
           </Field>
           <Field label="Connection type">
             <Select value={connectionType} onValueChange={(value: EnvironmentForm["connectionType"]) => setValue("connectionType", value)}>
@@ -1156,120 +1100,6 @@ function PortMappingDialog({
   );
 }
 
-function DeleteDialog({
-  title,
-  description,
-  submitLabel,
-  loading,
-  error,
-  onConfirm
-}: {
-  title: string;
-  description: string;
-  submitLabel: string;
-  loading: boolean;
-  error: string | null;
-  onConfirm: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="ghost" className="h-9 w-9 p-0">
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <DialogFooter className="md:col-span-2 gap-2">
-          <DialogClose asChild>
-            <Button type="button" variant="secondary">
-              Cancel
-            </Button>
-          </DialogClose>
-          <Button
-            type="button"
-            disabled={loading}
-            onClick={() => {
-              onConfirm();
-              setOpen(false);
-            }}
-          >
-            {submitLabel}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<React.ReactNode>> }) {
-  if (rows.length === 0) {
-    return <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">No data yet.</p>;
-  }
-
-  return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <div className="hidden grid-cols-[repeat(auto-fit,minmax(0,1fr))] bg-secondary/60 px-4 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground md:grid">
-        {headers.map((header) => (
-          <div key={header}>{header}</div>
-        ))}
-      </div>
-      {rows.map((row, rowIndex) => (
-        <div key={rowIndex} className="grid gap-3 border-t border-border px-4 py-4 text-sm text-foreground md:grid-cols-[repeat(auto-fit,minmax(0,1fr))]">
-          {row.map((cell, cellIndex) => (
-            <div key={cellIndex} className={cellIndex === row.length - 1 ? "md:text-right" : ""}>
-              <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground md:hidden">
-                {headers[cellIndex]}
-              </span>
-              {cell}
-            </div>
-          ))}
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  detail,
-  valueLabel
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value?: number;
-  detail: string;
-  valueLabel?: string;
-}) {
-  return (
-    <Card className="relative overflow-hidden bg-background/20">
-      <CardContent className="flex items-center gap-4 p-5">
-        {value !== undefined && (
-          <span className="pointer-events-none absolute -right-2 bottom-0 top-0 flex select-none items-center text-[72px] font-black leading-none text-foreground/[0.04]">
-            {value}
-          </span>
-        )}
-        <div className="relative rounded-md border border-primary/20 bg-primary/10 p-3">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-        <div className="relative">
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="text-2xl font-semibold text-foreground">{valueLabel ?? value ?? 0}</p>
-          <p className="text-xs text-muted-foreground">{detail}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function MiniStat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-md border border-border bg-background/30 px-4 py-3">
@@ -1288,18 +1118,43 @@ type DockerResourceStats = {
   sampledContainers: number;
 };
 
+type StatHistory = {
+  cpu: number[];
+  memPct: number[];
+  netTotal: number[];
+};
+
 function EnvironmentResourceStatsRow({ environmentId }: { environmentId: number }) {
+  const [history, setHistory] = useState<StatHistory>({ cpu: [], memPct: [], netTotal: [] });
+  const prevNetRef = useRef<{ rx: number; tx: number } | null>(null);
+
   const { data, isLoading } = useQuery({
     queryKey: ["docker-resource-stats", environmentId],
     queryFn: () => api<DockerResourceStats>(`/api/docker/environments/${environmentId}/resource-stats`),
-    staleTime: 30_000
+    refetchInterval: 5_000,
+    staleTime: 0
   });
+
+  useEffect(() => {
+    if (!data) return;
+    const memPct = data.memoryTotalBytes > 0 ? (data.memoryUsedBytes / data.memoryTotalBytes) * 100 : 0;
+    const prev = prevNetRef.current;
+    const netDelta = prev
+      ? Math.max(0, (data.networkRxBytes + data.networkTxBytes) - (prev.rx + prev.tx))
+      : 0;
+    prevNetRef.current = { rx: data.networkRxBytes, tx: data.networkTxBytes };
+    setHistory((h) => ({
+      cpu: [...h.cpu.slice(-19), data.cpuPercent],
+      memPct: [...h.memPct.slice(-19), memPct],
+      netTotal: [...h.netTotal.slice(-19), netDelta]
+    }));
+  }, [data]);
 
   if (isLoading) {
     return (
-      <div className="mt-3 grid grid-cols-3 gap-2">
+      <div className="mt-4 grid grid-cols-3 gap-3">
         {[0, 1, 2].map((i) => (
-          <div key={i} className="h-14 animate-pulse rounded-md border border-border bg-background/30" />
+          <div key={i} className="h-20 animate-pulse rounded-xl border border-border bg-background/30" />
         ))}
       </div>
     );
@@ -1307,27 +1162,46 @@ function EnvironmentResourceStatsRow({ environmentId }: { environmentId: number 
 
   if (!data) return null;
 
+  const memPct = data.memoryTotalBytes > 0 ? (data.memoryUsedBytes / data.memoryTotalBytes) * 100 : 0;
+  const cpuHigh = data.cpuPercent > 80;
+  const memHigh = memPct > 85;
+
   return (
-    <div className="mt-3 grid grid-cols-3 gap-2">
+    <div className="mt-4 grid grid-cols-3 gap-3">
       <ResourceStatTile
         label="CPU"
         primary={`${data.cpuPercent.toFixed(1)}%`}
-        secondary={`${data.sampledContainers} running`}
-        background={<CpuArcBackground percent={data.cpuPercent} />}
-        highlight={data.cpuPercent > 80}
+        secondary={`${data.sampledContainers} containers`}
+        sparkValues={history.cpu}
+        maxValue={100}
+        lineColor="#3b82f6"
+        fillColor="rgba(59,130,246,0.12)"
+        borderClass={cpuHigh ? "border-amber-500/40" : "border-blue-500/20"}
+        bgClass={cpuHigh ? "bg-amber-500/8" : "bg-blue-500/8"}
+        valueClass={cpuHigh ? "text-amber-400" : "text-blue-300"}
       />
       <ResourceStatTile
         label="RAM"
         primary={formatBytes(data.memoryUsedBytes)}
         secondary={data.memoryTotalBytes > 0 ? `of ${formatBytes(data.memoryTotalBytes)}` : "no limit"}
-        background={<RamBarBackground percent={data.memoryTotalBytes > 0 ? (data.memoryUsedBytes / data.memoryTotalBytes) * 100 : 0} />}
-        highlight={data.memoryTotalBytes > 0 && data.memoryUsedBytes / data.memoryTotalBytes > 0.85}
+        sparkValues={history.memPct}
+        maxValue={100}
+        lineColor="#8b5cf6"
+        fillColor="rgba(139,92,246,0.12)"
+        borderClass={memHigh ? "border-amber-500/40" : "border-violet-500/20"}
+        bgClass={memHigh ? "bg-amber-500/8" : "bg-violet-500/8"}
+        valueClass={memHigh ? "text-amber-400" : "text-violet-300"}
       />
       <ResourceStatTile
-        label="Net"
+        label="Net I/O"
         primary={`↑ ${formatBytes(data.networkTxBytes)}`}
         secondary={`↓ ${formatBytes(data.networkRxBytes)}`}
-        background={<NetArrowBackground />}
+        sparkValues={history.netTotal}
+        lineColor="#06b6d4"
+        fillColor="rgba(6,182,212,0.12)"
+        borderClass="border-cyan-500/20"
+        bgClass="bg-cyan-500/8"
+        valueClass="text-cyan-300"
       />
     </div>
   );
@@ -1337,61 +1211,61 @@ function ResourceStatTile({
   label,
   primary,
   secondary,
-  background,
-  highlight = false
+  sparkValues,
+  maxValue,
+  lineColor,
+  fillColor,
+  borderClass,
+  bgClass,
+  valueClass
 }: {
   label: string;
   primary: string;
   secondary: string;
-  background: React.ReactNode;
-  highlight?: boolean;
+  sparkValues: number[];
+  maxValue?: number;
+  lineColor: string;
+  fillColor: string;
+  borderClass: string;
+  bgClass: string;
+  valueClass: string;
 }) {
   return (
-    <div className={cn("relative overflow-hidden rounded-md border px-2.5 py-2", highlight ? "border-amber-500/30 bg-amber-500/5" : "border-border bg-background/40")}>
-      {background}
-      <div className="relative">
-        <p className="text-[9px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">{label}</p>
-        <p className={cn("mt-0.5 text-sm font-bold tabular-nums leading-none", highlight ? "text-amber-500" : "text-foreground")}>{primary}</p>
-        <p className="mt-0.5 text-[9px] text-muted-foreground/70 leading-none">{secondary}</p>
+    <div className={cn("relative overflow-hidden rounded-xl border px-3.5 pt-3.5 pb-2", borderClass, bgClass)}>
+      <Sparkline values={sparkValues} maxValue={maxValue} lineColor={lineColor} fillColor={fillColor} />
+      <div className="relative z-10">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">{label}</p>
+        <p className={cn("mt-1 text-lg font-bold tabular-nums leading-tight", valueClass)}>{primary}</p>
+        <p className="mt-0.5 text-[10px] leading-none text-muted-foreground/70">{secondary}</p>
       </div>
     </div>
   );
 }
 
-function CpuArcBackground({ percent }: { percent: number }) {
-  const r = 32;
-  const circ = 2 * Math.PI * r;
-  const filled = (Math.min(100, percent) / 100) * circ;
+function Sparkline({ values, maxValue, lineColor, fillColor }: {
+  values: number[];
+  maxValue?: number;
+  lineColor: string;
+  fillColor: string;
+}) {
+  if (values.length < 2) return null;
+  const W = 100;
+  const H = 32;
+  const max = maxValue ?? Math.max(...values, 1);
+  const pts = values.map((v, i) => ({
+    x: (i / (values.length - 1)) * W,
+    y: H - (Math.min(v, max) / max) * (H - 4)
+  }));
+  const lineD = pts.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+  const areaD = `M 0 ${H} ${pts.map((p) => `L ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ")} L ${W} ${H} Z`;
   return (
-    <svg className="absolute -right-3 -top-3 h-16 w-16 opacity-[0.10]" viewBox="0 0 72 72">
-      <circle cx="36" cy="36" r={r} fill="none" stroke="currentColor" strokeWidth="10" className="text-border" />
-      <circle
-        cx="36" cy="36" r={r}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="10"
-        strokeDasharray={`${filled} ${circ - filled}`}
-        transform="rotate(-90 36 36)"
-        className="text-primary"
-      />
-    </svg>
-  );
-}
-
-function RamBarBackground({ percent }: { percent: number }) {
-  const width = Math.min(100, percent);
-  return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1 overflow-hidden rounded-b-md opacity-30">
-      <div className="h-full bg-primary transition-all" style={{ width: `${width}%` }} />
-    </div>
-  );
-}
-
-function NetArrowBackground() {
-  return (
-    <svg viewBox="0 0 40 40" fill="currentColor" className="absolute right-1 top-1 h-10 w-10 opacity-[0.07] text-primary">
-      <path d="M20 4 L28 14 H23 V22 H17 V14 H12 Z" />
-      <path d="M20 36 L12 26 H17 V18 H23 V26 H28 Z" />
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="none"
+      className="absolute inset-x-0 bottom-0 h-8 w-full"
+    >
+      <path d={areaD} fill={fillColor} />
+      <path d={lineD} fill="none" stroke={lineColor} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -1491,23 +1365,6 @@ function ContainerStatsBar({ containers }: { containers: DockerContainerListItem
   );
 }
 
-function Field({
-  label,
-  children,
-  className
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={className}>
-      <Label className="mb-2 block">{label}</Label>
-      {children}
-    </div>
-  );
-}
-
 function normalizeEnvironmentForm(values: EnvironmentForm) {
   return {
     ...values,
@@ -1557,10 +1414,6 @@ function labelConnectionType(environment: DockerEnvironment) {
   if (environment.connectionType === "local_socket") return "Local socket";
   if (environment.connectionType === "tls") return "TLS";
   return "TCP";
-}
-
-function formatTimestamp(value: string | null | undefined) {
-  return value ? new Date(value).toLocaleString() : "n/a";
 }
 
 function formatBytes(bytes: number) {

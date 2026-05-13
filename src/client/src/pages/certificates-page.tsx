@@ -1,12 +1,14 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, FileKey2, Lock, Pencil, Plus, RefreshCcw, RotateCw, ShieldCheck, Trash2 } from "lucide-react";
+import { CheckCircle2, Download, FileKey2, Loader2, Lock, Pencil, Plus, RefreshCcw, RotateCw, ShieldCheck, XCircle } from "lucide-react";
 
 import { AppShell } from "@/components/layout/app-shell";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DataTable } from "@/components/ui/data-table";
+import { DeleteDialog } from "@/components/ui/delete-dialog";
 import {
   Dialog,
   DialogClose,
@@ -17,12 +19,17 @@ import {
   DialogTitle,
   DialogTrigger
 } from "@/components/ui/dialog";
+import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { MetricCard } from "@/components/ui/metric-card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
+import { useToast } from "@/hooks/use-toast";
+import { humanizeError } from "@/lib/errors";
+import { useAcmeProgress } from "@/hooks/use-acme-progress";
+import { formatTimestamp } from "@/lib/format";
 
 type CertificateSubject = {
   id: number;
@@ -125,15 +132,68 @@ type SubjectTreeItem = {
   depth: number;
 };
 
+// ─── ACME / Cloudflare types ──────────────────────────────────────────────────
+
+type CloudflareCredential = {
+  id: number;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AcmeAccount = {
+  id: number;
+  name: string;
+  email: string;
+  directoryUrl: string;
+  createdAt: string;
+};
+
+type AcmeCertificate = {
+  id: number;
+  name: string;
+  acmeAccountId: number;
+  acmeAccountName: string;
+  cloudflareCredentialId: number;
+  cloudflareCredentialName: string;
+  domains: string[];
+  serialNumber: string;
+  issuedAt: string;
+  expiresAt: string;
+  renewalDays: number;
+  active: boolean;
+};
+
+type AcmeAccountForm = { name: string; email: string; directoryUrl: string };
+type AcmeCertForm = {
+  name: string;
+  domains: string;
+  acmeAccountId: number;
+  cloudflareCredentialId: number;
+  renewalDays: number;
+};
+
+const ACME_DIRECTORIES = [
+  { label: "Let's Encrypt (production)", value: "https://acme-v02.api.letsencrypt.org/directory" },
+  { label: "Let's Encrypt (staging)", value: "https://acme-staging-v02.api.letsencrypt.org/directory" },
+  { label: "ZeroSSL", value: "https://acme.zerossl.com/v2/DV90" }
+];
+
 const certificateTabs = [
   { value: "subjects", label: "Subjects" },
   { value: "cas", label: "CAs" },
-  { value: "server", label: "Server Certs" }
+  { value: "server", label: "Server Certs" },
+  { value: "public", label: "Public Certs" },
+  { value: "acme-accounts", label: "ACME Accounts" }
 ];
 
 export function CertificatesPage() {
   const [activeTab, setActiveTab] = useState("subjects");
+  const [acmeProgressVisible, setAcmeProgressVisible] = useState(false);
+  const [acmeProgressTitle, setAcmeProgressTitle] = useState("Issuing certificate");
   const queryClient = useQueryClient();
+  const { error: toastError, success: toastSuccess } = useToast();
+  const acmeProgress = useAcmeProgress();
   const refreshDashboard = () => queryClient.invalidateQueries({ queryKey: ["certificates-dashboard"] });
 
   const dashboard = useQuery({
@@ -144,22 +204,26 @@ export function CertificatesPage() {
   const createSubjectMutation = useMutation({
     mutationFn: (payload: SubjectForm) =>
       api("/api/certificates/subjects", { method: "POST", body: JSON.stringify(normalizeSubjectForm(payload)) }),
-    onSuccess: refreshDashboard
+    onSuccess: refreshDashboard,
+    onError: (err) => toastError("Failed to create subject", humanizeError(err))
   });
   const updateSubjectMutation = useMutation({
     mutationFn: ({ id, payload }: { id: number; payload: SubjectForm }) =>
       api(`/api/certificates/subjects/${id}`, { method: "PUT", body: JSON.stringify(normalizeSubjectForm(payload)) }),
-    onSuccess: refreshDashboard
+    onSuccess: refreshDashboard,
+    onError: (err) => toastError("Failed to update subject", humanizeError(err))
   });
   const deleteSubjectMutation = useMutation({
     mutationFn: (id: number) => api(`/api/certificates/subjects/${id}`, { method: "DELETE" }),
-    onSuccess: refreshDashboard
+    onSuccess: refreshDashboard,
+    onError: (err) => toastError("Failed to delete subject", humanizeError(err))
   });
 
   const createCaMutation = useMutation({
     mutationFn: (payload: CertificateAuthorityForm) =>
       api("/api/certificates/cas", { method: "POST", body: JSON.stringify(payload) }),
-    onSuccess: refreshDashboard
+    onSuccess: refreshDashboard,
+    onError: (err) => toastError("Failed to create CA", humanizeError(err))
   });
 
   const createServerCertificateMutation = useMutation({
@@ -168,33 +232,66 @@ export function CertificatesPage() {
         method: "POST",
         body: JSON.stringify(normalizeServerCertificateForm(payload))
       }),
-    onSuccess: refreshDashboard
+    onSuccess: refreshDashboard,
+    onError: (err) => toastError("Failed to issue certificate", humanizeError(err))
   });
 
   const renewServerCertificateMutation = useMutation({
     mutationFn: (id: number) => api(`/api/certificates/server-certificates/${id}/renew`, { method: "POST" }),
-    onSuccess: refreshDashboard
+    onSuccess: () => { refreshDashboard(); toastSuccess("Certificate renewed successfully"); },
+    onError: (err) => toastError("Failed to renew certificate", humanizeError(err))
   });
 
-  const dialogError = useMemo(() => {
-    const errors = [
-      createSubjectMutation.error,
-      updateSubjectMutation.error,
-      deleteSubjectMutation.error,
-      createCaMutation.error,
-      createServerCertificateMutation.error,
-      renewServerCertificateMutation.error
-    ];
-    const first = errors.find((error) => error instanceof Error);
-    return first instanceof Error ? first.message : null;
-  }, [
-    createSubjectMutation.error,
-    updateSubjectMutation.error,
-    deleteSubjectMutation.error,
-    createCaMutation.error,
-    createServerCertificateMutation.error,
-    renewServerCertificateMutation.error
-  ]);
+  // ─── ACME / Cloudflare queries ─────────────────────────────────────────────
+
+  const cloudflareCredsQuery = useQuery({
+    queryKey: ["cloudflare-credentials"],
+    queryFn: () => api<CloudflareCredential[]>("/api/cloudflare/credentials")
+  });
+
+  const acmeAccountsQuery = useQuery({
+    queryKey: ["acme-accounts"],
+    queryFn: () => api<AcmeAccount[]>("/api/acme/accounts")
+  });
+
+  const acmeCertsQuery = useQuery({
+    queryKey: ["acme-certificates"],
+    queryFn: () => api<AcmeCertificate[]>("/api/acme/certificates")
+  });
+
+  const createAcmeAccountMutation = useMutation({
+    mutationFn: (payload: AcmeAccountForm) =>
+      api("/api/acme/accounts", { method: "POST", body: JSON.stringify(payload) }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["acme-accounts"] }),
+    onError: (err) => toastError("Failed to register ACME account", humanizeError(err))
+  });
+
+  const deleteAcmeAccountMutation = useMutation({
+    mutationFn: (id: number) => api(`/api/acme/accounts/${id}`, { method: "DELETE" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["acme-accounts"] }),
+    onError: (err) => toastError("Failed to delete ACME account", humanizeError(err))
+  });
+
+  const issueAcmeCertMutation = useMutation({
+    mutationFn: (payload: { name: string; domains: string[]; acmeAccountId: number; cloudflareCredentialId: number; renewalDays: number }) =>
+      api("/api/acme/certificates", { method: "POST", body: JSON.stringify(payload) }),
+    onMutate: () => { acmeProgress.start(); setAcmeProgressTitle("Issuing certificate"); setAcmeProgressVisible(true); },
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["acme-certificates"] }); toastSuccess("Certificate issued successfully"); },
+    onError: (err) => toastError("Failed to issue public certificate", humanizeError(err))
+  });
+
+  const renewAcmeCertMutation = useMutation({
+    mutationFn: (id: number) => api(`/api/acme/certificates/${id}/renew`, { method: "POST" }),
+    onMutate: () => { acmeProgress.start(); setAcmeProgressTitle("Renewing certificate"); setAcmeProgressVisible(true); },
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["acme-certificates"] }); toastSuccess("Certificate renewed successfully"); },
+    onError: (err) => toastError("Failed to renew certificate", humanizeError(err))
+  });
+
+  const deleteAcmeCertMutation = useMutation({
+    mutationFn: (id: number) => api(`/api/acme/certificates/${id}`, { method: "DELETE" }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["acme-certificates"] }),
+    onError: (err) => toastError("Failed to delete certificate", humanizeError(err))
+  });
 
   if (dashboard.isLoading || !dashboard.data) {
     return (
@@ -226,7 +323,6 @@ export function CertificatesPage() {
               description="Create a reusable X.509 subject profile for CAs and server certificates."
               submitLabel="Create subject"
               loading={createSubjectMutation.isPending}
-              error={dialogError}
               subjects={orderedSubjects}
               onSubmit={(values) => createSubjectMutation.mutate(values)}
               trigger={
@@ -245,7 +341,6 @@ export function CertificatesPage() {
               subjects={orderedSubjects}
               authorities={data.certificateAuthorities}
               loading={createCaMutation.isPending}
-              error={dialogError}
               onSubmit={(values) => createCaMutation.mutate(values)}
               trigger={
                 <Button>
@@ -263,12 +358,42 @@ export function CertificatesPage() {
               subjects={orderedSubjects}
               authorities={data.certificateAuthorities}
               loading={createServerCertificateMutation.isPending}
-              error={dialogError}
               onSubmit={(values) => createServerCertificateMutation.mutate(values)}
               trigger={
                 <Button>
                   <Plus className="h-4 w-4" />
                   Issue certificate
+                </Button>
+              }
+            />
+          ) : null}
+          {activeTab === "acme-accounts" ? (
+            <AcmeAccountDialog
+              title="Register ACME account"
+              description="Register a new account with an ACME certificate authority."
+              submitLabel="Register"
+              loading={createAcmeAccountMutation.isPending}
+              onSubmit={(values) => createAcmeAccountMutation.mutate(values)}
+              trigger={
+                <Button>
+                  <Plus className="h-4 w-4" />
+                  Register account
+                </Button>
+              }
+            />
+          ) : null}
+          {activeTab === "public" ? (
+            <IssueAcmeCertDialog
+              title="Issue public certificate"
+              description="Request a certificate from a public CA using DNS-01 challenge via Cloudflare."
+              loading={issueAcmeCertMutation.isPending}
+              accounts={acmeAccountsQuery.data ?? []}
+              credentials={cloudflareCredsQuery.data ?? []}
+              onSubmit={(values) => issueAcmeCertMutation.mutate(values)}
+              trigger={
+                <Button>
+                  <Plus className="h-4 w-4" />
+                  Issue public cert
                 </Button>
               }
             />
@@ -304,7 +429,6 @@ export function CertificatesPage() {
                     description="Adjust the reusable subject fields."
                     submitLabel="Save changes"
                     loading={updateSubjectMutation.isPending}
-                    error={dialogError}
                     subjects={orderedSubjects.filter((item) => item.subject.id !== subject.id)}
                     initialValues={subjectToForm(subject)}
                     onSubmit={(values) => updateSubjectMutation.mutate({ id: subject.id, payload: values })}
@@ -319,7 +443,6 @@ export function CertificatesPage() {
                     description={`This will remove ${subject.name} if it is not already used by a CA or certificate.`}
                     submitLabel="Delete subject"
                     loading={deleteSubjectMutation.isPending}
-                    error={dialogError}
                     onConfirm={() => deleteSubjectMutation.mutate(subject.id)}
                   />
                 </div>
@@ -376,6 +499,95 @@ export function CertificatesPage() {
           </CardContent>
         </Card>
       ) : null}
+
+      {activeTab === "acme-accounts" ? (
+        <Card className="bg-background/20">
+          <CardHeader>
+            <CardTitle>ACME accounts</CardTitle>
+            <CardDescription>Accounts registered with public certificate authorities (Let's Encrypt, ZeroSSL).</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <DataTable
+              headers={["Name", "Email", "Directory", "Created", "Actions"]}
+              rows={(acmeAccountsQuery.data ?? []).map((account) => [
+                account.name,
+                account.email,
+                <span key="dir" className="text-xs text-muted-foreground">
+                  {ACME_DIRECTORIES.find((d) => d.value === account.directoryUrl)?.label ?? account.directoryUrl}
+                </span>,
+                <span key="created" className="text-xs text-muted-foreground">{formatTimestamp(account.createdAt)}</span>,
+                <div key="actions" className="flex justify-end gap-2">
+                  <DeleteDialog
+                    title="Delete ACME account"
+                    description={`Remove account "${account.name}". Existing certificates remain valid but won't auto-renew.`}
+                    submitLabel="Delete account"
+                    loading={deleteAcmeAccountMutation.isPending}
+                    onConfirm={() => deleteAcmeAccountMutation.mutate(account.id)}
+                  />
+                </div>
+              ])}
+            />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {activeTab === "public" ? (
+        <Card className="bg-background/20">
+          <CardHeader>
+            <CardTitle>Public certificates</CardTitle>
+            <CardDescription>Certificates issued by public CAs via ACME DNS-01 challenge through Cloudflare.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <DataTable
+              headers={["Name", "Domains", "Account", "Validity", "Actions"]}
+              rows={(acmeCertsQuery.data ?? []).map((cert) => [
+                cert.name,
+                <div key="domains" className="flex flex-wrap gap-1">
+                  {cert.domains.map((d) => (
+                    <Badge key={d} variant="muted" className="font-mono text-[10px]">{d}</Badge>
+                  ))}
+                </div>,
+                cert.acmeAccountName,
+                <span key="validity" className="text-xs text-muted-foreground">
+                  {formatTimestamp(cert.issuedAt)} → {formatTimestamp(cert.expiresAt)}
+                </span>,
+                <div key="actions" className="flex justify-end gap-2">
+                  <Button
+                    variant="ghost"
+                    className="h-9 w-9 p-0"
+                    title="Renew"
+                    onClick={() => renewAcmeCertMutation.mutate(cert.id)}
+                    disabled={renewAcmeCertMutation.isPending}
+                  >
+                    <RotateCw className="h-4 w-4" />
+                  </Button>
+                  <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/acme/certificates/${cert.id}/download`)} />
+                  <DeleteDialog
+                    title="Delete certificate"
+                    description={`Permanently remove "${cert.name}". The certificate will be revoked with the CA.`}
+                    submitLabel="Delete certificate"
+                    loading={deleteAcmeCertMutation.isPending}
+                    onConfirm={() => deleteAcmeCertMutation.mutate(cert.id)}
+                  />
+                </div>
+              ])}
+            />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      <AcmeProgressDialog
+        open={acmeProgressVisible}
+        title={acmeProgressTitle}
+        steps={acmeProgress.steps}
+        isRunning={issueAcmeCertMutation.isPending || renewAcmeCertMutation.isPending}
+        onOpenChange={(open) => {
+          if (!open && !issueAcmeCertMutation.isPending && !renewAcmeCertMutation.isPending) {
+            setAcmeProgressVisible(false);
+            acmeProgress.clear();
+          }
+        }}
+      />
     </AppShell>
   );
 }
@@ -385,7 +597,6 @@ function SubjectDialog({
   description,
   submitLabel,
   loading,
-  error,
   subjects,
   initialValues,
   onSubmit,
@@ -395,14 +606,13 @@ function SubjectDialog({
   description: string;
   submitLabel: string;
   loading: boolean;
-  error: string | null;
   subjects: SubjectTreeItem[];
   initialValues?: SubjectForm;
   onSubmit: (values: SubjectForm) => void;
   trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const { register, handleSubmit, watch, setValue } = useForm<SubjectForm>({
+  const { register, handleSubmit, watch, setValue, formState: { errors } } = useForm<SubjectForm>({
     defaultValues:
       initialValues ??
       ({
@@ -433,8 +643,8 @@ function SubjectDialog({
             setOpen(false);
           })}
         >
-          <Field label="Profile name">
-            <Input {...register("name")} />
+          <Field label="Profile name" error={errors.name?.message}>
+            <Input {...register("name", { required: "Profile name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
           </Field>
           <Field label="Parent subject">
             <Select
@@ -454,28 +664,27 @@ function SubjectDialog({
               </SelectContent>
             </Select>
           </Field>
-          <Field label="Common name">
-            <Input placeholder={watch("parentSubjectId") == null ? "" : "inherit unless overridden"} {...register("commonName")} />
+          <Field label="Common name" error={errors.commonName?.message}>
+            <Input placeholder={watch("parentSubjectId") == null ? "" : "inherit unless overridden"} {...register("commonName", { maxLength: { value: 255, message: "Max 255 characters" } })} />
           </Field>
-          <Field label="Organization">
-            <Input {...register("organization")} />
+          <Field label="Organization" error={errors.organization?.message}>
+            <Input {...register("organization", { maxLength: { value: 255, message: "Max 255 characters" } })} />
           </Field>
-          <Field label="Org unit">
-            <Input {...register("organizationalUnit")} />
+          <Field label="Org unit" error={errors.organizationalUnit?.message}>
+            <Input {...register("organizationalUnit", { maxLength: { value: 255, message: "Max 255 characters" } })} />
           </Field>
-          <Field label="Country">
-            <Input maxLength={2} {...register("country")} />
+          <Field label="Country" error={errors.country?.message}>
+            <Input maxLength={2} {...register("country", { maxLength: { value: 2, message: "Use a 2-letter country code (e.g. US, IT)" } })} />
           </Field>
-          <Field label="State">
-            <Input {...register("state")} />
+          <Field label="State" error={errors.state?.message}>
+            <Input {...register("state", { maxLength: { value: 255, message: "Max 255 characters" } })} />
           </Field>
-          <Field label="Locality">
-            <Input {...register("locality")} />
+          <Field label="Locality" error={errors.locality?.message}>
+            <Input {...register("locality", { maxLength: { value: 255, message: "Max 255 characters" } })} />
           </Field>
-          <Field label="Email">
-            <Input type="email" {...register("emailAddress")} />
+          <Field label="Email" error={errors.emailAddress?.message}>
+            <Input type="email" {...register("emailAddress", { pattern: { value: /^[^\s@]+@[^\s@]+\.[^\s@]+$/, message: "Enter a valid email address" } })} />
           </Field>
-          {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
           <DialogFooter className="md:col-span-2">
             <DialogClose asChild>
               <Button type="button" variant="secondary">
@@ -495,11 +704,10 @@ function SubjectDialog({
 function CertificateAuthorityDialog({
   title,
   description,
-      submitLabel,
-      subjects,
-      authorities,
+  submitLabel,
+  subjects,
+  authorities,
   loading,
-  error,
   onSubmit,
   trigger
 }: {
@@ -509,12 +717,11 @@ function CertificateAuthorityDialog({
   subjects: SubjectTreeItem[];
   authorities: CertificateAuthority[];
   loading: boolean;
-  error: string | null;
   onSubmit: (values: CertificateAuthorityForm) => void;
   trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const { register, handleSubmit, watch, setValue } = useForm<CertificateAuthorityForm>({
+  const { register, handleSubmit, watch, setValue, formState: { errors: caErrors } } = useForm<CertificateAuthorityForm>({
     defaultValues: {
       name: "",
       subjectId: subjects[0]?.subject.id ?? 0,
@@ -543,8 +750,8 @@ function CertificateAuthorityDialog({
             setOpen(false);
           })}
         >
-          <Field label="CA name">
-            <Input {...register("name")} />
+          <Field label="CA name" error={caErrors.name?.message}>
+            <Input {...register("name", { required: "CA name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
           </Field>
           <Field label="Subject">
             <Select value={String(watch("subjectId"))} onValueChange={(value) => setValue("subjectId", Number(value))}>
@@ -578,10 +785,10 @@ function CertificateAuthorityDialog({
               </SelectContent>
             </Select>
           </Field>
-          <Field label="Validity days">
-            <Input type="number" {...register("validityDays", { valueAsNumber: true })} />
+          <Field label="Validity days" error={caErrors.validityDays?.message}>
+            <Input type="number" {...register("validityDays", { valueAsNumber: true, required: "Validity is required", min: { value: 30, message: "Minimum 30 days" }, max: { value: 3650, message: "Maximum 3650 days (10 years)" } })} />
           </Field>
-          <Field label="Path length">
+          <Field label="Path length" error={caErrors.pathLength?.message}>
             <Input
               type="number"
               {...register("pathLength", {
@@ -601,7 +808,6 @@ function CertificateAuthorityDialog({
               <Switch checked={watch("active")} onCheckedChange={(value) => setValue("active", value)} />
             </div>
           </Field>
-          {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
           <DialogFooter className="md:col-span-2 gap-2">
             <DialogClose asChild>
               <Button type="button" variant="secondary">
@@ -625,7 +831,6 @@ function ServerCertificateDialog({
   subjects,
   authorities,
   loading,
-  error,
   onSubmit,
   trigger
 }: {
@@ -635,12 +840,11 @@ function ServerCertificateDialog({
   subjects: SubjectTreeItem[];
   authorities: CertificateAuthority[];
   loading: boolean;
-  error: string | null;
   onSubmit: (values: ServerCertificateForm) => void;
   trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const { register, handleSubmit, watch, setValue } = useForm<ServerCertificateForm>({
+  const { register, handleSubmit, watch, setValue, formState: { errors: scErrors } } = useForm<ServerCertificateForm>({
     defaultValues: {
       name: "",
       subjectId: subjects[0]?.subject.id ?? 0,
@@ -667,8 +871,8 @@ function ServerCertificateDialog({
             setOpen(false);
           })}
         >
-          <Field label="Certificate name">
-            <Input {...register("name")} />
+          <Field label="Certificate name" error={scErrors.name?.message}>
+            <Input {...register("name", { required: "Certificate name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
           </Field>
           <Field label="Subject">
             <Select value={String(watch("subjectId"))} onValueChange={(value) => setValue("subjectId", Number(value))}>
@@ -698,11 +902,11 @@ function ServerCertificateDialog({
               </SelectContent>
             </Select>
           </Field>
-          <Field label="Validity days">
-            <Input type="number" {...register("validityDays", { valueAsNumber: true })} />
+          <Field label="Validity days" error={scErrors.validityDays?.message}>
+            <Input type="number" {...register("validityDays", { valueAsNumber: true, required: "Validity is required", min: { value: 1, message: "Must be at least 1 day" }, max: { value: 825, message: "Maximum 825 days" } })} />
           </Field>
-          <Field label="Renewal window">
-            <Input type="number" {...register("renewalDays", { valueAsNumber: true })} />
+          <Field label="Renewal window (days)" error={scErrors.renewalDays?.message}>
+            <Input type="number" {...register("renewalDays", { valueAsNumber: true, required: "Renewal window is required", min: { value: 1, message: "Must be at least 1 day" }, max: { value: 365, message: "Maximum 365 days" } })} />
           </Field>
           <Field label="Active">
             <div className="flex h-10 items-center justify-between rounded-md border border-input bg-secondary/60 px-3">
@@ -710,14 +914,13 @@ function ServerCertificateDialog({
               <Switch checked={watch("active")} onCheckedChange={(value) => setValue("active", value)} />
             </div>
           </Field>
-          <Field label="SAN entries" className="md:col-span-2">
+          <Field label="SAN entries" className="md:col-span-2" error={scErrors.subjectAltNames?.message}>
             <textarea
               className="min-h-28 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
               placeholder="web.lan, api.lan, 10.0.0.15"
-              {...register("subjectAltNames")}
+              {...register("subjectAltNames", { required: "At least one SAN entry is required" })}
             />
           </Field>
-          {error ? <p className="md:col-span-2 text-sm text-destructive">{error}</p> : null}
           <DialogFooter className="md:col-span-2 gap-2">
             <DialogClose asChild>
               <Button type="button" variant="secondary">
@@ -819,132 +1022,235 @@ function DownloadButton({ label, onClick }: { label: string; onClick: () => void
   );
 }
 
-function DeleteDialog({
+function AcmeAccountDialog({
   title,
   description,
   submitLabel,
   loading,
-  error,
-  onConfirm
+  onSubmit,
+  trigger
 }: {
   title: string;
   description: string;
   submitLabel: string;
   loading: boolean;
-  error: string | null;
-  onConfirm: () => void;
+  onSubmit: (values: AcmeAccountForm) => void;
+  trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  const { register, handleSubmit, watch, setValue, formState: { errors: acmeAccErrors } } = useForm<AcmeAccountForm>({
+    defaultValues: { name: "", email: "", directoryUrl: ACME_DIRECTORIES[0].value }
+  });
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="ghost" className="h-9 w-9 p-0">
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </DialogTrigger>
+      <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <DialogFooter className="md:col-span-2 gap-2">
-          <DialogClose asChild>
-            <Button type="button" variant="secondary">
-              Cancel
-            </Button>
-          </DialogClose>
-          <Button
-            type="button"
-            disabled={loading}
-            onClick={() => {
-              onConfirm();
-              setOpen(false);
-            }}
-          >
-            {submitLabel}
-          </Button>
-        </DialogFooter>
+        <form
+          className="space-y-4"
+          onSubmit={handleSubmit((values) => {
+            onSubmit(values);
+            setOpen(false);
+          })}
+        >
+          <Field label="Account name" error={acmeAccErrors.name?.message}>
+            <Input placeholder="e.g. lets-encrypt-prod" {...register("name", { required: "Account name is required", minLength: { value: 2, message: "Must be at least 2 characters" } })} />
+          </Field>
+          <Field label="Email" error={acmeAccErrors.email?.message}>
+            <Input type="email" placeholder="admin@example.com" {...register("email", { required: "Email is required", pattern: { value: /^[^\s@]+@[^\s@]+\.[^\s@]+$/, message: "Enter a valid email address" } })} />
+          </Field>
+          <Field label="Directory">
+            <Select value={watch("directoryUrl")} onValueChange={(value) => setValue("directoryUrl", value)}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {ACME_DIRECTORIES.map((dir) => (
+                  <SelectItem key={dir.value} value={dir.value}>{dir.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button type="submit" disabled={loading}>{submitLabel}</Button>
+          </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   );
 }
 
-function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<React.ReactNode>> }) {
-  if (rows.length === 0) {
-    return <p className="rounded-md border border-dashed border-border px-4 py-10 text-sm text-muted-foreground">No items yet.</p>;
-  }
+function IssueAcmeCertDialog({
+  title,
+  description,
+  loading,
+  accounts,
+  credentials,
+  onSubmit,
+  trigger
+}: {
+  title: string;
+  description: string;
+  loading: boolean;
+  accounts: AcmeAccount[];
+  credentials: CloudflareCredential[];
+  onSubmit: (values: { name: string; domains: string[]; acmeAccountId: number; cloudflareCredentialId: number; renewalDays: number }) => void;
+  trigger: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const { register, handleSubmit, watch, setValue, formState: { errors: acmeCertErrors } } = useForm<AcmeCertForm>({
+    defaultValues: {
+      name: "",
+      domains: "",
+      acmeAccountId: accounts[0]?.id ?? 0,
+      cloudflareCredentialId: credentials[0]?.id ?? 0,
+      renewalDays: 30
+    }
+  });
 
   return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <div className="grid grid-cols-1">
-        <div className="hidden grid-cols-[repeat(auto-fit,minmax(0,1fr))] bg-secondary/60 px-4 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground md:grid">
-          {headers.map((header) => (
-            <div key={header}>{header}</div>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>{trigger}</DialogTrigger>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <form
+          className="space-y-4"
+          onSubmit={handleSubmit((values) => {
+            const domains = values.domains
+              .split(/[\n,]+/)
+              .map((d) => d.trim())
+              .filter(Boolean);
+            onSubmit({
+              name: values.name,
+              domains,
+              acmeAccountId: values.acmeAccountId,
+              cloudflareCredentialId: values.cloudflareCredentialId,
+              renewalDays: values.renewalDays
+            });
+            setOpen(false);
+          })}
+        >
+          <Field label="Certificate name" error={acmeCertErrors.name?.message}>
+            <Input placeholder="e.g. wildcard-example-com" {...register("name", { required: "Certificate name is required", minLength: { value: 2, message: "Must be at least 2 characters" } })} />
+          </Field>
+          <Field label="Domains" error={acmeCertErrors.domains?.message}>
+            <textarea
+              className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              placeholder="example.com, *.example.com"
+              {...register("domains", { required: "At least one domain is required" })}
+            />
+          </Field>
+          <Field label="ACME account">
+            <Select
+              value={String(watch("acmeAccountId"))}
+              onValueChange={(value) => setValue("acmeAccountId", Number(value))}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select account" />
+              </SelectTrigger>
+              <SelectContent>
+                {accounts.map((account) => (
+                  <SelectItem key={account.id} value={String(account.id)}>{account.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="Cloudflare credential">
+            <Select
+              value={String(watch("cloudflareCredentialId"))}
+              onValueChange={(value) => setValue("cloudflareCredentialId", Number(value))}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select credential" />
+              </SelectTrigger>
+              <SelectContent>
+                {credentials.map((cred) => (
+                  <SelectItem key={cred.id} value={String(cred.id)}>{cred.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+          <Field label="Renewal window (days)">
+            <Input type="number" {...register("renewalDays", { valueAsNumber: true })} />
+          </Field>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button type="button" variant="secondary">Cancel</Button>
+            </DialogClose>
+            <Button type="submit" disabled={loading}>
+              {loading ? "Issuing…" : "Issue certificate"}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AcmeProgressDialog({
+  open,
+  title,
+  steps,
+  isRunning,
+  onOpenChange
+}: {
+  open: boolean;
+  title: string;
+  steps: { step: string; status: "running" | "done" | "error"; detail?: string }[];
+  isRunning: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="max-w-lg"
+        onPointerDownOutside={(e) => { if (isRunning) e.preventDefault(); }}
+        onEscapeKeyDown={(e) => { if (isRunning) e.preventDefault(); }}
+      >
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>
+            {isRunning
+              ? "Please wait — this may take up to a minute while DNS propagation completes."
+              : "Operation finished. Review the steps below and close when ready."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3 py-1">
+          {steps.length === 0 && isRunning ? (
+            <div className="flex items-center gap-3 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              <span>Starting…</span>
+            </div>
+          ) : null}
+          {steps.map((s) => (
+            <div key={s.step} className="flex items-start gap-3">
+              {s.status === "running" && <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary" />}
+              {s.status === "done" && <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-green-500" />}
+              {s.status === "error" && <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />}
+              <div className="min-w-0">
+                <p className="text-sm font-medium leading-tight">{s.step}</p>
+                {s.detail ? <p className="mt-0.5 text-xs text-muted-foreground">{s.detail}</p> : null}
+              </div>
+            </div>
           ))}
         </div>
-        {rows.map((row, rowIndex) => (
-          <div
-            key={rowIndex}
-            className="grid gap-3 border-t border-border px-4 py-4 text-sm text-foreground md:grid-cols-[repeat(auto-fit,minmax(0,1fr))]"
-          >
-            {row.map((cell, cellIndex) => (
-              <div key={cellIndex} className={cellIndex === row.length - 1 ? "md:text-right" : ""}>
-                <span className="mb-1 block text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground md:hidden">
-                  {headers[cellIndex]}
-                </span>
-                {cell}
-              </div>
-            ))}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  detail
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: number;
-  detail: string;
-}) {
-  return (
-    <Card className="bg-background/20">
-      <CardContent className="flex items-center gap-4 p-5">
-        <div className="rounded-md border border-primary/20 bg-primary/10 p-3">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-        <div>
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="text-2xl font-semibold text-foreground">{value}</p>
-          <p className="text-xs text-muted-foreground">{detail}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function Field({
-  label,
-  children,
-  className
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={className}>
-      <Label className="mb-2 block">{label}</Label>
-      {children}
-    </div>
+        {!isRunning ? (
+          <DialogFooter>
+            <Button onClick={() => onOpenChange(false)}>Close</Button>
+          </DialogFooter>
+        ) : null}
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1022,13 +1328,6 @@ function subjectToForm(subject: CertificateSubject): SubjectForm {
     locality: subject.locality ?? "",
     emailAddress: subject.emailAddress ?? ""
   };
-}
-
-function formatTimestamp(value: string | null) {
-  if (!value) {
-    return "n/a";
-  }
-  return new Date(value).toLocaleString();
 }
 
 async function downloadPem(path: string) {

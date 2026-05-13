@@ -1,13 +1,15 @@
 import { useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, Lock, Network, Plus, RefreshCcw, ShieldCheck, Split, Trash2, Pencil } from "lucide-react";
+import { Activity, Lock, Network, Pencil, Plus, RefreshCcw, ShieldCheck, Split } from "lucide-react";
 
 import { AppShell } from "@/components/layout/app-shell";
 import { Badge } from "@/components/ui/badge";
 import type { BadgeVariant } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { DataTable } from "@/components/ui/data-table";
+import { DeleteDialog } from "@/components/ui/delete-dialog";
 import {
   Dialog,
   DialogClose,
@@ -18,13 +20,16 @@ import {
   DialogTitle,
   DialogTrigger
 } from "@/components/ui/dialog";
+import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { MetricCard } from "@/components/ui/metric-card";
+import { ProtocolBadge } from "@/components/ui/protocol-badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
 import { formatEventPayload } from "@/lib/event-format";
+import { formatTimestamp } from "@/lib/format";
 
 type ProxyRoute = {
   id: number;
@@ -158,6 +163,15 @@ type ServerCertificate = {
   active: boolean;
 };
 
+type AcmeCertificate = {
+  id: number;
+  name: string;
+  domains: string[];
+  certificatePem: string;
+  expiresAt: string;
+  active: boolean;
+};
+
 type HttpsCertificateMode = "existing" | "quick" | "current";
 
 const HTTP_LISTENER = { address: "0.0.0.0", port: 80 };
@@ -195,26 +209,22 @@ export function ProxyPage() {
 
   const runtimeStatus = useQuery({
     queryKey: ["proxy-runtime-status"],
-    queryFn: () => api<ProxyRuntimeStatus>("/api/proxy/runtime/status"),
-    refetchInterval: activeTab === "runtime" ? 3000 : false
+    queryFn: () => api<ProxyRuntimeStatus>("/api/proxy/runtime/status")
   });
 
   const runtimeMetrics = useQuery({
     queryKey: ["proxy-runtime-metrics"],
-    queryFn: () => api<ProxyRuntimeMetrics>("/api/proxy/runtime/metrics"),
-    refetchInterval: activeTab === "runtime" ? 4000 : false
+    queryFn: () => api<ProxyRuntimeMetrics>("/api/proxy/runtime/metrics")
   });
 
   const runtimeLogs = useQuery({
     queryKey: ["proxy-runtime-logs"],
-    queryFn: () => api<ProxyLog[]>("/api/proxy/runtime/logs?limit=20"),
-    refetchInterval: activeTab === "runtime" ? 4000 : false
+    queryFn: () => api<ProxyLog[]>("/api/proxy/runtime/logs?limit=20")
   });
 
   const runtimeEvents = useQuery({
     queryKey: ["proxy-runtime-events"],
-    queryFn: () => api<EventItem[]>("/api/proxy/events?limit=20"),
-    refetchInterval: activeTab === "runtime" ? 5000 : false
+    queryFn: () => api<EventItem[]>("/api/proxy/events?limit=20")
   });
   const networkInterfaces = useQuery({
     queryKey: ["network-interfaces"],
@@ -223,6 +233,10 @@ export function ProxyPage() {
   const serverCertificates = useQuery({
     queryKey: ["server-certificates"],
     queryFn: () => api<ServerCertificate[]>("/api/certificates/server-certificates")
+  });
+  const acmeCertificates = useQuery({
+    queryKey: ["acme-certificates"],
+    queryFn: () => api<AcmeCertificate[]>("/api/acme/certificates")
   });
   const certificateAuthorities = useQuery({
     queryKey: ["certificate-authorities"],
@@ -286,6 +300,7 @@ export function ProxyPage() {
               error={dialogError}
               networkInterfaces={networkInterfaces.data?.interfaces ?? []}
               serverCertificates={serverCertificates.data ?? []}
+              acmeCertificates={acmeCertificates.data ?? []}
               certificateAuthorities={certificateAuthorities.data ?? []}
               onSubmit={(values) => createMutation.mutateAsync(values)}
               trigger={
@@ -318,6 +333,7 @@ export function ProxyPage() {
               managedRouteIds={dashboard.data.managedRouteIds}
               networkInterfaces={networkInterfaces.data?.interfaces ?? []}
               serverCertificates={serverCertificates.data ?? []}
+              acmeCertificates={acmeCertificates.data ?? []}
               certificateAuthorities={certificateAuthorities.data ?? []}
               updateLoading={updateMutation.isPending}
               deleteLoading={deleteMutation.isPending}
@@ -421,6 +437,7 @@ function RoutesTable({
   managedRouteIds,
   networkInterfaces,
   serverCertificates,
+  acmeCertificates,
   certificateAuthorities,
   updateLoading,
   deleteLoading,
@@ -432,6 +449,7 @@ function RoutesTable({
   managedRouteIds: number[];
   networkInterfaces: NetworkInterface[];
   serverCertificates: ServerCertificate[];
+  acmeCertificates: AcmeCertificate[];
   certificateAuthorities: CertificateAuthority[];
   updateLoading: boolean;
   deleteLoading: boolean;
@@ -455,7 +473,10 @@ function RoutesTable({
       ? <span key="match" className="font-mono text-xs">{route.sourceHost ?? "*"}{route.sourcePath ?? "/"}</span>
       : <span key="match" className="text-muted-foreground text-xs">Transport</span>,
     <span key="target" className="font-mono text-xs">{route.targetProtocol}://{route.targetHost}:{route.targetPort}</span>,
-    <Badge key="state" variant={route.enabled ? "success" : "muted"} dot>{route.enabled ? "Active" : "Disabled"}</Badge>
+    <span key="state" className="flex flex-col gap-1">
+      <Badge variant={route.enabled ? "success" : "muted"} dot>{route.enabled ? "Active" : "Disabled"}</Badge>
+      <HealthBadge status={route.healthStatus} />
+    </span>
   ];
 
   return (
@@ -515,6 +536,7 @@ function RoutesTable({
                   error={error}
                   networkInterfaces={networkInterfaces}
                   serverCertificates={serverCertificates}
+                  acmeCertificates={acmeCertificates}
                   certificateAuthorities={certificateAuthorities}
                   initialValues={routeToForm(route)}
                   onSubmit={(values) => onUpdate(route.id, values)}
@@ -555,6 +577,7 @@ function ProxyRouteDialog({
   error,
   networkInterfaces,
   serverCertificates,
+  acmeCertificates,
   certificateAuthorities,
   initialValues,
   onSubmit,
@@ -567,6 +590,7 @@ function ProxyRouteDialog({
   error: string | null;
   networkInterfaces: NetworkInterface[];
   serverCertificates: ServerCertificate[];
+  acmeCertificates: AcmeCertificate[];
   certificateAuthorities: CertificateAuthority[];
   initialValues?: ProxyRouteForm;
   onSubmit: (values: ProxyRouteForm) => Promise<unknown>;
@@ -574,7 +598,7 @@ function ProxyRouteDialog({
 }) {
   const [open, setOpen] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
-  const { register, handleSubmit, watch, setValue } = useForm<ProxyRouteForm>({
+  const { register, handleSubmit, watch, setValue, formState: { errors } } = useForm<ProxyRouteForm>({
     defaultValues:
       initialValues ??
       ({
@@ -599,21 +623,22 @@ function ProxyRouteDialog({
   const isHttpFamily = protocol === "http" || protocol === "https";
   const isHttps = protocol === "https";
   const hasCurrentTlsMaterial = Boolean(initialValues?.tlsCertPem && initialValues?.tlsKeyPem);
-  const matchingCurrentCertificate = hasCurrentTlsMaterial
-    ? serverCertificates.find(
-        (certificate) =>
-          certificate.certificatePem === initialValues?.tlsCertPem && certificate.privateKeyPem === initialValues?.tlsKeyPem
-      ) ?? null
+  const matchingServerCert = hasCurrentTlsMaterial
+    ? serverCertificates.find((c) => c.certificatePem === initialValues?.tlsCertPem) ?? null
     : null;
+  const matchingAcmeCert = !matchingServerCert && hasCurrentTlsMaterial
+    ? acmeCertificates.find((c) => c.certificatePem === initialValues?.tlsCertPem) ?? null
+    : null;
+  const matchingCurrentCertificate = matchingServerCert ?? matchingAcmeCert;
+  const defaultCertId = matchingServerCert ? `server:${matchingServerCert.id}`
+    : matchingAcmeCert ? `acme:${matchingAcmeCert.id}` : "";
   const defaultHttpsMode: HttpsCertificateMode = matchingCurrentCertificate
     ? "existing"
     : hasCurrentTlsMaterial
       ? "current"
       : "existing";
   const [httpsCertificateMode, setHttpsCertificateMode] = useState<HttpsCertificateMode>(defaultHttpsMode);
-  const [selectedServerCertificateId, setSelectedServerCertificateId] = useState<string>(
-    matchingCurrentCertificate ? String(matchingCurrentCertificate.id) : ""
-  );
+  const [selectedCertId, setSelectedCertId] = useState<string>(defaultCertId);
   const activeCertificateAuthorities = certificateAuthorities.filter((authority) => authority.active);
   const quickIssueAuthorities = activeCertificateAuthorities.filter((authority) => authority.isSelfSigned);
   const quickIssueAuthorityOptions = quickIssueAuthorities.length > 0 ? quickIssueAuthorities : activeCertificateAuthorities;
@@ -629,7 +654,7 @@ function ProxyRouteDialog({
         if (nextOpen) {
           setLocalError(null);
           setHttpsCertificateMode(defaultHttpsMode);
-          setSelectedServerCertificateId(matchingCurrentCertificate ? String(matchingCurrentCertificate.id) : "");
+          setSelectedCertId(defaultCertId);
           setQuickIssueCaId(defaultQuickCa ? String(defaultQuickCa.id) : "");
         }
       }}
@@ -647,8 +672,9 @@ function ProxyRouteDialog({
               setLocalError(null);
               const nextValues = await buildRoutePayloadFromDialog(values, {
                 httpsCertificateMode,
-                selectedServerCertificateId,
+                selectedCertId,
                 serverCertificates,
+                acmeCertificates,
                 quickIssueCaId,
                 certificateAuthorities: quickIssueAuthorityOptions
               });
@@ -659,8 +685,8 @@ function ProxyRouteDialog({
             }
           })}
         >
-          <Field label="Name">
-            <Input {...register("name")} />
+          <Field label="Name" error={errors.name?.message}>
+            <Input {...register("name", { required: "Route name is required", minLength: { value: 2, message: "Must be at least 2 characters" }, maxLength: { value: 120, message: "Max 120 characters" } })} />
           </Field>
           <Field label="Protocol">
             <Select
@@ -728,19 +754,19 @@ function ProxyRouteDialog({
             </>
           ) : (
             <>
-              <Field label="Listen address">
-                <Input {...register("listenAddress")} />
+              <Field label="Listen address" error={errors.listenAddress?.message}>
+                <Input {...register("listenAddress", { required: "Listen address is required" })} />
               </Field>
-              <Field label="Listen port">
-                <Input type="number" {...register("listenPort", { valueAsNumber: true })} />
+              <Field label="Listen port" error={errors.listenPort?.message}>
+                <Input type="number" {...register("listenPort", { valueAsNumber: true, required: "Listen port is required", min: { value: 1, message: "Port must be between 1 and 65535" }, max: { value: 65535, message: "Port must be between 1 and 65535" } })} />
               </Field>
             </>
           )}
-          <Field label="Target host">
-            <Input {...register("targetHost")} />
+          <Field label="Target host" error={errors.targetHost?.message}>
+            <Input {...register("targetHost", { required: "Target host is required", minLength: { value: 1, message: "Enter a valid hostname or IP" } })} />
           </Field>
-          <Field label="Target port">
-            <Input type="number" {...register("targetPort", { valueAsNumber: true })} />
+          <Field label="Target port" error={errors.targetPort?.message}>
+            <Input type="number" {...register("targetPort", { valueAsNumber: true, required: "Target port is required", min: { value: 1, message: "Port must be between 1 and 65535" }, max: { value: 65535, message: "Port must be between 1 and 65535" } })} />
           </Field>
           <Field label="Target protocol">
             <Select value={watch("targetProtocol")} onValueChange={(value: ProxyRouteForm["targetProtocol"]) => setValue("targetProtocol", value)}>
@@ -800,18 +826,21 @@ function ProxyRouteDialog({
                 />
               </Field>
               {httpsCertificateMode === "existing" ? (
-                <Field label="Server certificate" className="md:col-span-2">
-                  <Select value={selectedServerCertificateId} onValueChange={setSelectedServerCertificateId}>
+                <Field label="TLS certificate" className="md:col-span-2">
+                  <Select value={selectedCertId} onValueChange={setSelectedCertId}>
                     <SelectTrigger>
-                      <SelectValue placeholder="Select a server certificate" />
+                      <SelectValue placeholder="Select a certificate" />
                     </SelectTrigger>
                     <SelectContent>
-                      {serverCertificates
-                        .filter((certificate) => certificate.active || certificate.id === matchingCurrentCertificate?.id)
-                        .map((certificate) => (
-                        <SelectItem key={certificate.id} value={String(certificate.id)}>
-                          {certificate.name} · {certificate.commonName}
-                          {certificate.subjectAltNames.length > 0 ? ` · ${certificate.subjectAltNames.join(", ")}` : ""}
+                      {serverCertificates.filter((c) => c.active || `server:${c.id}` === selectedCertId).map((c) => (
+                        <SelectItem key={`server:${c.id}`} value={`server:${c.id}`}>
+                          [Internal] {c.name} · {c.commonName}
+                          {c.subjectAltNames.length > 0 ? ` · ${c.subjectAltNames.join(", ")}` : ""}
+                        </SelectItem>
+                      ))}
+                      {acmeCertificates.filter((c) => c.active || `acme:${c.id}` === selectedCertId).map((c) => (
+                        <SelectItem key={`acme:${c.id}`} value={`acme:${c.id}`}>
+                          [Public] {c.name} · {c.domains.join(", ")}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -870,141 +899,12 @@ function ProxyRouteDialog({
   );
 }
 
-function ProtocolBadge({ protocol }: { protocol: "http" | "https" | "tcp" | "udp" }) {
-  const variants: Record<string, BadgeVariant> = { http: "default", https: "success", tcp: "warning", udp: "muted" };
-  return <Badge variant={variants[protocol] ?? "default"}>{protocol.toUpperCase()}</Badge>;
-}
-
-function DeleteDialog({
-  title,
-  description,
-  loading,
-  error,
-  onConfirm
-}: {
-  title: string;
-  description: string;
-  loading: boolean;
-  error: string | null;
-  onConfirm: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-
+function HealthBadge({ status }: { status: "unknown" | "healthy" | "degraded" }) {
+  if (status === "unknown") return null;
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="ghost" className="h-9 w-9 p-0">
-          <Trash2 className="h-4 w-4" />
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
-        </DialogHeader>
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <DialogFooter className="md:col-span-2 gap-2">
-          <DialogClose asChild>
-            <Button type="button" variant="secondary">
-              Cancel
-            </Button>
-          </DialogClose>
-          <Button
-            type="button"
-            disabled={loading}
-            onClick={() => {
-              onConfirm();
-              setOpen(false);
-            }}
-          >
-            Delete route
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function Field({
-  label,
-  children,
-  className
-}: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={className}>
-      <Label className="mb-2 block text-sm text-muted-foreground">{label}</Label>
-      {children}
-    </div>
-  );
-}
-
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  detail,
-  valueLabel
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value?: number;
-  detail: string;
-  valueLabel?: string;
-}) {
-  return (
-    <Card className="bg-background/20">
-      <CardContent className="flex items-center justify-between p-5">
-        <div>
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="mt-2 text-2xl font-semibold text-foreground">{valueLabel ?? value ?? 0}</p>
-          <p className="mt-1 text-xs text-muted-foreground">{detail}</p>
-        </div>
-        <div className="rounded-md border border-primary/20 bg-primary/10 p-2">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
-function DataTable({ headers, rows }: { headers: string[]; rows: Array<Array<React.ReactNode>> }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="min-w-full text-left text-sm">
-        <thead className="text-xs uppercase tracking-[0.12em] text-muted-foreground">
-          <tr>
-            {headers.map((header) => (
-              <th key={header} className="border-b border-border px-3 py-3 font-medium">
-                {header}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={headers.length} className="px-3 py-6 text-sm text-muted-foreground">
-                No data yet.
-              </td>
-            </tr>
-          ) : (
-            rows.map((row, index) => (
-              <tr key={index} className="border-b border-border/70">
-                {row.map((cell, cellIndex) => (
-                  <td key={cellIndex} className="px-3 py-3 align-top text-foreground">
-                    {cell}
-                  </td>
-                ))}
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
-    </div>
+    <Badge variant={status === "healthy" ? "success" : "danger"} dot>
+      {status === "healthy" ? "Healthy" : "Degraded"}
+    </Badge>
   );
 }
 
@@ -1049,8 +949,9 @@ async function buildRoutePayloadFromDialog(
   values: ProxyRouteForm,
   options: {
     httpsCertificateMode: HttpsCertificateMode;
-    selectedServerCertificateId: string;
+    selectedCertId: string;
     serverCertificates: ServerCertificate[];
+    acmeCertificates: AcmeCertificate[];
     quickIssueCaId: string;
     certificateAuthorities: CertificateAuthority[];
   }
@@ -1064,15 +965,25 @@ async function buildRoutePayloadFromDialog(
   }
 
   if (options.httpsCertificateMode === "existing") {
-    const certificate = options.serverCertificates.find((entry) => String(entry.id) === options.selectedServerCertificateId);
-    if (!certificate) {
-      throw new Error("Select a server certificate for this HTTPS route");
+    const { selectedCertId } = options;
+    if (!selectedCertId) throw new Error("Select a certificate for this HTTPS route");
+
+    if (selectedCertId.startsWith("server:")) {
+      const id = selectedCertId.slice(7);
+      const certificate = options.serverCertificates.find((c) => String(c.id) === id);
+      if (!certificate) throw new Error("Select a server certificate for this HTTPS route");
+      return { ...values, tlsCertPem: certificate.certificatePem, tlsKeyPem: certificate.privateKeyPem };
     }
-    return {
-      ...values,
-      tlsCertPem: certificate.certificatePem,
-      tlsKeyPem: certificate.privateKeyPem
-    };
+
+    if (selectedCertId.startsWith("acme:")) {
+      const id = Number(selectedCertId.slice(5));
+      const material = await api<{ certificatePem: string; privateKeyPem: string }>(
+        `/api/acme/certificates/${id}/material`
+      );
+      return { ...values, tlsCertPem: material.certificatePem, tlsKeyPem: material.privateKeyPem };
+    }
+
+    throw new Error("Select a certificate for this HTTPS route");
   }
 
   const hostname = values.sourceHost.trim();
@@ -1151,10 +1062,6 @@ function slugifyHostname(hostname: string) {
     .replace(/[^a-z0-9.-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
-}
-
-function formatTimestamp(value: string | null | undefined) {
-  return value ? new Date(value).toLocaleString() : "n/a";
 }
 
 const compactJson = formatEventPayload;

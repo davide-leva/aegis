@@ -5,7 +5,9 @@ import {
   Cpu,
   FileKey2,
   Globe2,
+  KeyRound,
   Network,
+  Settings,
   Shield,
   ShieldCheck,
   Waypoints
@@ -28,6 +30,8 @@ const navigation = [
   { to: "/proxy", label: "Proxy", icon: ShieldCheck, available: true },
   { to: "/docker", label: "Docker Discovery", icon: Boxes, available: true },
   { to: "/mappings", label: "Mappings", icon: Cable, available: true },
+  { to: "/api-keys", label: "API Keys", icon: KeyRound, available: true },
+  { to: "/settings", label: "Settings", icon: Settings, available: true },
   { to: "/system", label: "System", icon: Cpu, available: true },
   { to: "/network", label: "Network Policy", icon: Network, available: false },
   { to: "/audit", label: "Audit Trail", icon: Waypoints, available: false }

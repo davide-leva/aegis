@@ -2,16 +2,22 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
+  AlertTriangle,
   Ban,
   Boxes,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Cpu,
   Globe,
+  Info,
   Network,
   RefreshCcw,
   Save,
   ServerCog,
   ShieldCheck,
   Split,
+  XCircle,
 } from "lucide-react";
 
 import { AppShell } from "@/components/layout/app-shell";
@@ -21,11 +27,15 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
 import { api } from "@/lib/api";
-import { formatEventPayload } from "@/lib/event-format";
+import { formatEventPayload, humanizeEvent, eventSeverity, type EventSeverity } from "@/lib/event-format";
+import { formatTimestamp } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { MetricCard } from "@/components/ui/metric-card";
+import { SimpleTable } from "@/components/ui/simple-table";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -57,11 +67,15 @@ type DnsRuntimeMetrics = {
   totalQueries: number;
   authoritativeQueries: number;
   upstreamQueries: number;
+  cachedQueries: number;
   blockedQueries: number;
   nxDomainQueries: number;
   servfailQueries: number;
   avgDurationMs: number;
   lastQueryAt: string | null;
+  cacheSize: number;
+  cacheHits: number;
+  cacheMisses: number;
 };
 
 type DnsRuntimeLog = {
@@ -113,6 +127,8 @@ type ProxyLog = {
 type EventItem = {
   id: number;
   topic: string;
+  aggregateType: string;
+  aggregateId: string;
   payload: string;
   createdAt: string;
 };
@@ -129,17 +145,21 @@ const systemTabs = [
   { value: "status", label: "Status" },
   { value: "interfaces", label: "Interfaces" },
   { value: "dns", label: "DNS Runtime" },
-  { value: "proxy", label: "Proxy Runtime" }
+  { value: "proxy", label: "Proxy Runtime" },
+  { value: "events", label: "Events" }
 ];
+
+const PAGE_SIZE = 50;
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export function SystemPage() {
   const [activeTab, setActiveTab] = useState("status");
+  const [eventsPage, setEventsPage] = useState(0);
+  const [eventsTopicFilter, setEventsTopicFilter] = useState("");
+  const [eventsTopicInput, setEventsTopicInput] = useState("");
+  const [eventsSeverityFilter, setEventsSeverityFilter] = useState<EventSeverity | "all">("all");
   const queryClient = useQueryClient();
-
-  const isOnDns = activeTab === "dns";
-  const isOnProxy = activeTab === "proxy";
 
   // Interfaces
   const interfacesQuery = useQuery({
@@ -159,45 +179,50 @@ export function SystemPage() {
   // DNS runtime
   const dnsStatus = useQuery({
     queryKey: ["dns-runtime-status"],
-    queryFn: () => api<DnsRuntimeStatus>("/api/dns/runtime/status"),
-    refetchInterval: isOnDns ? 3000 : isOnDns === false && activeTab === "status" ? 10000 : false
+    queryFn: () => api<DnsRuntimeStatus>("/api/dns/runtime/status")
   });
   const dnsMetrics = useQuery({
     queryKey: ["dns-runtime-metrics"],
-    queryFn: () => api<DnsRuntimeMetrics>("/api/dns/runtime/metrics"),
-    refetchInterval: isOnDns ? 4000 : false
+    queryFn: () => api<DnsRuntimeMetrics>("/api/dns/runtime/metrics")
   });
   const dnsLogs = useQuery({
     queryKey: ["dns-runtime-logs"],
-    queryFn: () => api<DnsRuntimeLog[]>("/api/dns/runtime/logs?limit=20"),
-    refetchInterval: isOnDns ? 4000 : false
+    queryFn: () => api<DnsRuntimeLog[]>("/api/dns/runtime/logs?limit=20")
   });
   const dnsEvents = useQuery({
     queryKey: ["dns-runtime-events"],
-    queryFn: () => api<EventItem[]>("/api/dns/events?limit=20"),
-    refetchInterval: isOnDns ? 5000 : false
+    queryFn: () => api<EventItem[]>("/api/dns/events?limit=20")
   });
 
   // Proxy runtime
   const proxyStatus = useQuery({
     queryKey: ["proxy-runtime-status"],
-    queryFn: () => api<ProxyRuntimeStatus>("/api/proxy/runtime/status"),
-    refetchInterval: isOnProxy ? 3000 : activeTab === "status" ? 10000 : false
+    queryFn: () => api<ProxyRuntimeStatus>("/api/proxy/runtime/status")
   });
   const proxyMetrics = useQuery({
     queryKey: ["proxy-runtime-metrics"],
-    queryFn: () => api<ProxyRuntimeMetrics>("/api/proxy/runtime/metrics"),
-    refetchInterval: isOnProxy ? 4000 : false
+    queryFn: () => api<ProxyRuntimeMetrics>("/api/proxy/runtime/metrics")
   });
   const proxyLogs = useQuery({
     queryKey: ["proxy-runtime-logs"],
-    queryFn: () => api<ProxyLog[]>("/api/proxy/runtime/logs?limit=20"),
-    refetchInterval: isOnProxy ? 4000 : false
+    queryFn: () => api<ProxyLog[]>("/api/proxy/runtime/logs?limit=20")
   });
   const proxyEvents = useQuery({
     queryKey: ["proxy-runtime-events"],
-    queryFn: () => api<EventItem[]>("/api/proxy/events?limit=20"),
-    refetchInterval: isOnProxy ? 5000 : false
+    queryFn: () => api<EventItem[]>("/api/proxy/events?limit=20")
+  });
+
+  const eventsQuery = useQuery({
+    queryKey: ["domain-events", eventsPage, eventsTopicFilter],
+    queryFn: () => {
+      const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(eventsPage * PAGE_SIZE)
+      });
+      if (eventsTopicFilter) params.set("topic", eventsTopicFilter);
+      return api<{ items: EventItem[]; total: number }>(`/api/events?${params.toString()}`);
+    },
+    enabled: activeTab === "events"
   });
 
   // Docker (for status panel)
@@ -247,6 +272,11 @@ export function SystemPage() {
         </>
       ) : activeTab === "status" ? (
         <Button variant="secondary" onClick={() => { refreshRuntime(); queryClient.invalidateQueries({ queryKey: ["docker-dashboard"] }); }}>
+          <RefreshCcw className="h-4 w-4" />
+          Refresh
+        </Button>
+      ) : activeTab === "events" ? (
+        <Button variant="secondary" onClick={() => queryClient.invalidateQueries({ queryKey: ["domain-events"] })}>
           <RefreshCcw className="h-4 w-4" />
           Refresh
         </Button>
@@ -305,6 +335,22 @@ export function SystemPage() {
           metrics={proxyMetrics.data}
           logs={proxyLogs.data ?? []}
           events={proxyEvents.data ?? []}
+        />
+      ) : null}
+
+      {activeTab === "events" ? (
+        <EventsPanel
+          items={eventsQuery.data?.items ?? []}
+          total={eventsQuery.data?.total ?? 0}
+          page={eventsPage}
+          pageSize={PAGE_SIZE}
+          topicInput={eventsTopicInput}
+          severityFilter={eventsSeverityFilter}
+          isLoading={eventsQuery.isLoading}
+          onTopicInputChange={(v) => setEventsTopicInput(v)}
+          onTopicSearch={(v) => { setEventsTopicFilter(v); setEventsPage(0); }}
+          onSeverityChange={(v) => { setEventsSeverityFilter(v); setEventsPage(0); }}
+          onPageChange={setEventsPage}
         />
       ) : null}
     </AppShell>
@@ -582,6 +628,11 @@ function DnsRuntimePanel({
         <MetricCard icon={Network} label="Upstream queries" value={metrics?.upstreamQueries ?? 0} detail={`${metrics?.avgDurationMs?.toFixed(1) ?? "0.0"} ms avg`} />
         <MetricCard icon={Ban} label="Denied" value={metrics?.blockedQueries ?? 0} detail={`${metrics?.servfailQueries ?? 0} servfail`} />
       </div>
+      <div className="grid gap-4 xl:grid-cols-3">
+        <MetricCard icon={Cpu} label="Cache entries" value={metrics?.cacheSize ?? 0} detail={`${metrics?.cachedQueries ?? 0} served from cache`} />
+        <MetricCard icon={RefreshCcw} label="Cache hits" value={metrics?.cacheHits ?? 0} detail={metrics ? `${metrics.cacheHits + metrics.cacheMisses > 0 ? ((metrics.cacheHits / (metrics.cacheHits + metrics.cacheMisses)) * 100).toFixed(1) : "0.0"}% hit rate` : "n/a"} />
+        <MetricCard icon={Globe} label="Cache misses" value={metrics?.cacheMisses ?? 0} detail="upstream lookups required" />
+      </div>
 
       <div className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
         <Card className="bg-background/20">
@@ -735,40 +786,6 @@ function ProxyRuntimePanel({
 
 // ─── Shared UI ────────────────────────────────────────────────────────────────
 
-function MetricCard({
-  icon: Icon,
-  label,
-  value,
-  detail,
-  valueLabel
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value?: number;
-  detail: string;
-  valueLabel?: string;
-}) {
-  return (
-    <Card className="relative overflow-hidden bg-background/20">
-      <CardContent className="flex items-center gap-4 p-5">
-        {value !== undefined && (
-          <span className="pointer-events-none absolute -right-2 bottom-0 top-0 flex select-none items-center text-[72px] font-black leading-none text-foreground/[0.04]">
-            {value}
-          </span>
-        )}
-        <div className="relative rounded-md border border-primary/20 bg-primary/10 p-3">
-          <Icon className="h-5 w-5 text-primary" />
-        </div>
-        <div className="relative">
-          <p className="text-sm text-muted-foreground">{label}</p>
-          <p className="text-2xl font-semibold text-foreground">{valueLabel ?? value ?? 0}</p>
-          <p className="text-xs text-muted-foreground">{detail}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 function StatusRow({ label, value, stateBadge }: { label: string; value: string; stateBadge?: boolean }) {
   const stateVariant = (s: string): BadgeVariant =>
     s === "running" ? "success" : s === "error" ? "danger" : s === "starting" ? "warning" : "muted";
@@ -787,39 +804,188 @@ function StatusRow({ label, value, stateBadge }: { label: string; value: string;
   );
 }
 
-function SimpleTable({ headers, rows }: { headers: string[]; rows: Array<Array<React.ReactNode>> }) {
+// ─── Events panel ─────────────────────────────────────────────────────────────
+
+const SEVERITY_TOPICS: Record<string, string> = {
+  "dns": "dns.",
+  "proxy": "proxy.",
+  "certificate": "certificate.",
+  "acme": "acme.",
+  "docker": "docker."
+};
+
+function severityBadgeVariant(severity: EventSeverity): BadgeVariant {
+  if (severity === "error") return "danger";
+  if (severity === "warning") return "warning";
+  if (severity === "success") return "success";
+  return "muted";
+}
+
+function SeverityIcon({ severity }: { severity: EventSeverity }) {
+  if (severity === "error") return <XCircle className="h-3.5 w-3.5 text-destructive" />;
+  if (severity === "warning") return <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />;
+  if (severity === "success") return <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />;
+  return <Info className="h-3.5 w-3.5 text-muted-foreground" />;
+}
+
+function EventsPanel({
+  items,
+  total,
+  page,
+  pageSize,
+  topicInput,
+  severityFilter,
+  isLoading,
+  onTopicInputChange,
+  onTopicSearch,
+  onSeverityChange,
+  onPageChange
+}: {
+  items: EventItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+  topicInput: string;
+  severityFilter: EventSeverity | "all";
+  isLoading: boolean;
+  onTopicInputChange: (v: string) => void;
+  onTopicSearch: (v: string) => void;
+  onSeverityChange: (v: EventSeverity | "all") => void;
+  onPageChange: (page: number) => void;
+}) {
+  const totalPages = Math.ceil(total / pageSize);
+
+  const visibleItems = severityFilter === "all"
+    ? items
+    : items.filter((e) => eventSeverity(e.topic) === severityFilter);
+
   return (
-    <div className="overflow-hidden rounded-md border border-border">
-      <table className="w-full text-left text-sm">
-        <thead className="bg-secondary/60 text-muted-foreground">
-          <tr>
-            {headers.map((h, i) => (
-              <th key={h} className={cn("px-4 py-3 font-medium text-xs uppercase tracking-[0.12em]", i === headers.length - 1 ? "text-right" : "")}>
-                {h}
-              </th>
+    <div className="space-y-4">
+      <Card className="bg-background/20">
+        <CardHeader>
+          <CardTitle>Domain events</CardTitle>
+          <CardDescription>All system events recorded by Aegis, ordered by most recent first.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Filters */}
+          <div className="flex flex-wrap gap-3">
+            <div className="flex min-w-0 flex-1 gap-2">
+              <Input
+                placeholder="Filter by topic prefix (e.g. dns, proxy, acme)"
+                value={topicInput}
+                onChange={(e) => onTopicInputChange(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") onTopicSearch(topicInput); }}
+                className="max-w-sm"
+              />
+              <Button variant="secondary" onClick={() => onTopicSearch(topicInput)}>Search</Button>
+              {topicInput && (
+                <Button variant="ghost" onClick={() => { onTopicInputChange(""); onTopicSearch(""); }}>Clear</Button>
+              )}
+            </div>
+            <Select value={severityFilter} onValueChange={(v) => onSeverityChange(v as EventSeverity | "all")}>
+              <SelectTrigger className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All severities</SelectItem>
+                <SelectItem value="success">Success</SelectItem>
+                <SelectItem value="info">Info</SelectItem>
+                <SelectItem value="warning">Warning</SelectItem>
+                <SelectItem value="error">Error</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Quick topic filters */}
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(SEVERITY_TOPICS).map(([label, prefix]) => (
+              <Button
+                key={label}
+                variant="ghost"
+                className="h-7 px-3 text-xs"
+                onClick={() => { onTopicInputChange(label); onTopicSearch(prefix); }}
+              >
+                {label}
+              </Button>
             ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={headers.length} className="px-4 py-8 text-center text-sm text-muted-foreground">
-                No data yet.
-              </td>
-            </tr>
+          </div>
+
+          {/* Table */}
+          {isLoading ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">Loading events…</p>
           ) : (
-            rows.map((row, ri) => (
-              <tr key={ri} className="border-t border-border/80">
-                {row.map((cell, ci) => (
-                  <td key={ci} className={cn("px-4 py-3 align-top", ci === row.length - 1 ? "text-right" : "")}>
-                    {cell}
-                  </td>
-                ))}
-              </tr>
-            ))
+            <div className="overflow-hidden rounded-md border border-border">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-secondary/60 text-muted-foreground">
+                  <tr>
+                    <th className="px-4 py-3 font-medium text-xs uppercase tracking-[0.12em]">Time</th>
+                    <th className="px-4 py-3 font-medium text-xs uppercase tracking-[0.12em]">Severity</th>
+                    <th className="px-4 py-3 font-medium text-xs uppercase tracking-[0.12em]">Topic</th>
+                    <th className="px-4 py-3 font-medium text-xs uppercase tracking-[0.12em]">Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleItems.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="px-4 py-8 text-center text-sm text-muted-foreground">
+                        No events recorded yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    visibleItems.map((event) => {
+                      const sev = eventSeverity(event.topic);
+                      return (
+                        <tr key={event.id} className="border-t border-border/80">
+                          <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">
+                            {new Date(event.createdAt).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-1.5">
+                              <SeverityIcon severity={sev} />
+                              <Badge variant={severityBadgeVariant(sev)} className="text-[10px]">{sev}</Badge>
+                            </div>
+                          </td>
+                          <td className="px-4 py-3">
+                            <span className="font-mono text-xs text-muted-foreground">{event.topic}</span>
+                          </td>
+                          <td className="px-4 py-3 text-sm">
+                            {humanizeEvent(event.topic, event.payload)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           )}
-        </tbody>
-      </table>
+
+          {/* Pagination */}
+          {totalPages > 1 && (
+            <div className="flex items-center justify-between text-sm text-muted-foreground">
+              <span>{total.toLocaleString()} total events — page {page + 1} of {totalPages}</span>
+              <div className="flex gap-1">
+                <Button
+                  variant="ghost"
+                  className="h-8 w-8 p-0"
+                  disabled={page === 0}
+                  onClick={() => onPageChange(page - 1)}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  className="h-8 w-8 p-0"
+                  disabled={page >= totalPages - 1}
+                  onClick={() => onPageChange(page + 1)}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -839,11 +1005,6 @@ function protocolVariant(protocol: string): BadgeVariant {
   if (protocol === "http") return "default";
   if (protocol === "tcp") return "warning";
   return "muted";
-}
-
-function formatTimestamp(value?: string | null) {
-  if (!value) return "n/a";
-  return new Date(value).toLocaleString();
 }
 
 const compactJson = formatEventPayload;
