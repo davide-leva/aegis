@@ -81,6 +81,7 @@ export class DnsService {
         name: input.defaultZoneSuffix.replace(/^\./, ""),
         kind: "local",
         description: "Bootstrap local primary zone",
+        cloudflareCredentialId: null,
         isPrimary: true,
         isReverse: false,
         ttl: 3600,
@@ -229,7 +230,7 @@ export class DnsService {
     const zone = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
       const events = new EventBus(repos);
-      const zone = await repos.zones.create(input);
+      const zone = await repos.zones.create(normalizeZoneInput(input));
       await repos.audit.create({
         action: "zone.create",
         entityType: "dns_zone",
@@ -260,7 +261,7 @@ export class DnsService {
       if (!existing) {
         throw new Error("Zone not found");
       }
-      const zone = await repos.zones.update(id, input);
+      const zone = await repos.zones.update(id, normalizeZoneInput(input));
       await repos.audit.create({
         action: "zone.update",
         entityType: "dns_zone",
@@ -672,6 +673,13 @@ export class DnsService {
       context
     });
   }
+}
+
+function normalizeZoneInput(input: NewZone): NewZone {
+  return {
+    ...input,
+    cloudflareCredentialId: input.kind === "local" ? input.cloudflareCredentialId ?? null : null
+  };
 }
 
 function buildBootstrapStatus(

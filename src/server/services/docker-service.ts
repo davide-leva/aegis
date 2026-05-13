@@ -1,16 +1,14 @@
 import { EventBus } from "../events/event-bus.js";
-import { generateServerCertificate } from "../lib/pki.js";
 import { getCanonicalProxyListener } from "../lib/proxy-listeners.js";
 import { getEnvironmentResourceStats, inspectDockerContainer, listDockerContainers, watchDockerContainerEvents } from "../lib/docker-api.js";
 import type { DockerContainerEvent } from "../lib/docker-api.js";
-import type { AuditContext, DockerEnvironment as DockerEnvironmentEntity } from "../types.js";
+import { issueAcmeOrderMaterial } from "./acme-service.js";
+import type { AcmeCertificate, AuditContext, DockerEnvironment as DockerEnvironmentEntity } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
-import type { NewCertificateSubject } from "../repositories/certificate-subject-repository.js";
 import type { NewDockerEnvironment } from "../repositories/docker-environment-repository.js";
 import type { NewDockerPortMapping } from "../repositories/docker-port-mapping-repository.js";
 import type { NewProxyRoute } from "../repositories/proxy-route-repository.js";
 import type { NewRecord } from "../repositories/dns-record-repository.js";
-import type { NewServerCertificate } from "../repositories/server-certificate-repository.js";
 
 interface ProxyRuntimeControl {
   requestReload(): void;
@@ -196,10 +194,16 @@ export class DockerService {
     const environment = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
       const events = new EventBus(repos);
-      const existing = await repos.dockerEnvironments.delete(id);
+      const existing = await repos.dockerEnvironments.getById(id);
       if (!existing) {
         throw new Error("Docker environment not found");
       }
+      const mappings = await repos.dockerPortMappings.listByEnvironment(id);
+      for (const mapping of mappings) {
+        await releaseMappingResources(repos, events, mapping, "environment_deleted", context);
+      }
+
+      await repos.dockerEnvironments.delete(id);
       await repos.audit.create({
         action: "docker.environment.delete",
         entityType: "docker_environment",
@@ -216,6 +220,9 @@ export class DockerService {
       });
       return existing;
     });
+
+    this.proxyRuntimeControl?.requestReload();
+    this.dnsRuntimeControl?.requestReload();
     return environment;
   }
 
@@ -244,7 +251,8 @@ export class DockerService {
     const defaultInterface = await this.repositories.networkInterfaces.getDefault();
 
     const containerMappings = mappings.filter((mapping) => mapping.containerId === detail.id);
-    const automapAnalysis = analyzeAutomap(detail, containerMappings, defaultInterface);
+    const existingRouteNames = (await this.repositories.proxyRoutes.list()).map((route) => route.name);
+    const automapAnalysis = analyzeAutomap(detail, containerMappings, defaultInterface, existingRouteNames);
     const enriched = {
       ...detail,
       mappings: containerMappings,
@@ -297,10 +305,6 @@ export class DockerService {
       const target = resolveTarget(container, environment.publicIp, input.privatePort, input.publicPort, input.protocol);
       const protocol = input.routeProtocol;
       const dnsName = normalizeDnsName(input.dnsName);
-      const defaultRoot = protocol === "https" ? await resolveDefaultRootCertificateAuthority(repos) : null;
-      if (protocol === "https" && !defaultRoot) {
-        throw new Error("No default Root CA available for HTTPS mappings");
-      }
 
       const dnsRecordResult = await ensureDnsRecord(repos, {
         dnsName,
@@ -327,29 +331,16 @@ export class DockerService {
 
       const serverCertificate =
         protocol === "https"
-          ? await ensureServerCertificateForHostname(repos, {
+          ? await ensureHttpsCertificateForHostname(
+              repos,
+              events,
+              {
               dnsName,
-              routeName: input.routeName.trim(),
-              certificateAuthorityId: defaultRoot!.id
-            })
+                routeName: input.routeName.trim()
+              },
+              context
+            )
           : null;
-      if (serverCertificate?.id) {
-        const redactedCertificate = redactServerCertificate(serverCertificate) ?? {};
-        await repos.audit.create({
-          action: "certificate.server.create",
-          entityType: "server_certificate",
-          entityId: String(serverCertificate.id),
-          payload: redactedCertificate,
-          context
-        });
-        await events.publish({
-          topic: "certificate.server.created",
-          aggregateType: "server_certificate",
-          aggregateId: String(serverCertificate.id),
-          payload: redactedCertificate,
-          context
-        });
-      }
 
       const route = await repos.proxyRoutes.create({
         ...normalizeDockerRouteListener(protocol, networkInterface.address, {
@@ -475,7 +466,13 @@ export class DockerService {
   ) {
     const mappings = await this.repositories.dockerPortMappings.listByEnvironment(environment.id);
     const containerMappings = mappings.filter((mapping) => mapping.containerId === detail.id);
-    const analysis = analyzeAutomap(detail, containerMappings, await this.repositories.networkInterfaces.getDefault());
+    const existingRouteNames = (await this.repositories.proxyRoutes.list()).map((route) => route.name);
+    const analysis = analyzeAutomap(
+      detail,
+      containerMappings,
+      await this.repositories.networkInterfaces.getDefault(),
+      existingRouteNames
+    );
     const pending = analysis.candidates.filter((candidate) => !candidate.alreadyMapped);
 
     for (const issue of analysis.issues) {
@@ -577,6 +574,24 @@ export class DockerService {
     listedContainers?: Awaited<ReturnType<typeof listDockerContainers>>
   ) {
     const containers = listedContainers ?? (await listDockerContainers(environment));
+    const activeContainerIds = new Set(containers.map((container) => container.id));
+    const staleMappings = (await this.repositories.dockerPortMappings.listByEnvironment(environment.id)).filter(
+      (mapping) => !activeContainerIds.has(mapping.containerId)
+    );
+
+    for (const mapping of staleMappings) {
+      await this.repositories.db.transaction(async (trx) => {
+        const repos = createRepositories(trx);
+        const events = new EventBus(repos);
+        await releaseMappingResources(repos, events, mapping, "container_missing", context);
+      });
+    }
+
+    if (staleMappings.length > 0) {
+      this.proxyRuntimeControl?.requestReload();
+      this.dnsRuntimeControl?.requestReload();
+    }
+
     for (const container of containers.filter((item) => hasAegisLabels(item.labels))) {
       const detail = await inspectDockerContainer(environment, container.id);
       await this.reconcileContainerAutomap(environment, detail, context);
@@ -877,20 +892,6 @@ function resolveTargetProtocol(routeProtocol: "http" | "https" | "tcp" | "udp", 
   return routeProtocol;
 }
 
-async function resolveDefaultRootCertificateAuthority(repos: Repositories) {
-  const direct = await repos.certificateAuthorities.getDefaultRoot();
-  if (direct && direct.active && direct.isSelfSigned) {
-    return direct;
-  }
-
-  const fallback = (await repos.certificateAuthorities.list()).find((authority) => authority.active && authority.isSelfSigned) ?? null;
-  if (fallback?.id && (!direct || direct.id !== fallback.id)) {
-    await repos.certificateAuthorities.setDefaultRoot(fallback.id);
-    return repos.certificateAuthorities.getById(fallback.id);
-  }
-  return fallback;
-}
-
 async function ensureDnsRecord(
   repos: Repositories,
   input: {
@@ -936,69 +937,125 @@ async function ensureDnsRecord(
   };
 }
 
-async function ensureServerCertificateForHostname(
+async function ensureHttpsCertificateForHostname(
   repos: Repositories,
+  events: EventBus,
   input: {
     dnsName: string;
     routeName: string;
-    certificateAuthorityId: number;
-  }
+  },
+  context: AuditContext
 ) {
-  const authority = await repos.certificateAuthorities.getById(input.certificateAuthorityId);
-  if (!authority) {
-    throw new Error("Default Root CA not found");
-  }
-  const parentSubject = await repos.certificateSubjects.getById(authority.subjectId);
-  if (!parentSubject) {
-    throw new Error("Default Root CA subject not found");
+  const existing = await findBestAcmeCertificateForHostname(repos, input.dnsName);
+  if (existing) {
+    return existing;
   }
 
-  const subjectName = uniqueName(`${input.routeName}-subject`, (await repos.certificateSubjects.list()).map((item) => item.name));
-  const subject = await repos.certificateSubjects.create({
-    name: subjectName,
-    parentSubjectId: parentSubject.id,
-    parentSubjectName: parentSubject.name,
-    commonName: input.dnsName,
-    organization: parentSubject.organization,
-    organizationalUnit: "Aegis",
-    country: parentSubject.country,
-    state: parentSubject.state,
-    locality: parentSubject.locality,
-    emailAddress: parentSubject.emailAddress
-  } satisfies NewCertificateSubject);
-
-  if (!subject) {
-    throw new Error("Failed to create certificate subject");
+  const zone = await resolveManagedZoneForHostname(repos, input.dnsName);
+  if (!zone) {
+    throw new Error(`No imported Cloudflare zone matches ${input.dnsName}. Import the zone before creating an HTTPS mapping.`);
+  }
+  if (!zone.cloudflareCredentialId) {
+    throw new Error(`Zone ${zone.name} is not linked to a Cloudflare credential. Re-import the zone from Cloudflare before creating an HTTPS mapping.`);
   }
 
-  const material = await generateServerCertificate({
-    subject,
-    validityDays: 397,
-    subjectAltNames: [input.dnsName],
-    issuer: {
-      certificatePem: authority.certificatePem,
-      privateKeyPem: authority.privateKeyPem
-    }
-  });
+  const [account, credential] = await Promise.all([
+    resolveAcmeAccount(repos),
+    repos.cloudflareCredentials.getById(zone.cloudflareCredentialId)
+  ]);
+  if (!account) {
+    throw new Error("No ACME account configured. Create an ACME account before creating HTTPS mappings.");
+  }
+  if (!credential) {
+    throw new Error(`Cloudflare credential ${zone.cloudflareCredentialId} for zone ${zone.name} was not found`);
+  }
 
-  return repos.serverCertificates.create({
-    name: uniqueName(`${input.routeName}-tls`, (await repos.serverCertificates.list()).map((item) => item.name)),
-    subjectId: subject.id,
-    caId: authority.id,
-    subjectAltNames: [input.dnsName],
+  const material = await issueAcmeOrderMaterial(account, credential, [input.dnsName]);
+  const created = await repos.acmeCertificates.create({
+    name: uniqueName(`${input.routeName}-tls`, (await repos.acmeCertificates.list()).map((item) => item.name)),
+    acmeAccountId: account.id,
+    cloudflareCredentialId: credential.id,
+    domains: [input.dnsName],
     certificatePem: material.certificatePem,
     privateKeyPem: material.privateKeyPem,
     chainPem: material.chainPem,
     serialNumber: material.serialNumber,
     issuedAt: material.issuedAt,
     expiresAt: material.expiresAt,
-    validityDays: 397,
     renewalDays: 30,
     active: true
-  } satisfies NewServerCertificate);
+  });
+
+  await repos.audit.create({
+    action: "acme.certificate.issue",
+    entityType: "acme_certificate",
+    entityId: String(created.id),
+    payload: { name: created.name, domains: created.domains, expiresAt: created.expiresAt },
+    context
+  });
+  await events.publish({
+    topic: "acme.certificate.issued",
+    aggregateType: "acme_certificate",
+    aggregateId: String(created.id),
+    payload: { name: created.name, domains: created.domains, expiresAt: created.expiresAt },
+    context
+  });
+
+  return created;
 }
 
-function pickZoneForHostname(hostname: string, zones: Array<{ id: number; name: string }>) {
+async function resolveManagedZoneForHostname(repos: Repositories, hostname: string) {
+  const zones = (await repos.zones.list()).filter((zone) => zone.enabled && zone.kind === "local");
+  return pickZoneForHostname(hostname, zones);
+}
+
+async function resolveAcmeAccount(repos: Repositories) {
+  const accounts = await repos.acmeAccounts.list();
+  return accounts[0] ?? null;
+}
+
+async function findBestAcmeCertificateForHostname(repos: Repositories, hostname: string) {
+  const now = Date.now();
+  const candidates = (await repos.acmeCertificates.list())
+    .filter((certificate) => certificate.active)
+    .map((certificate) => ({
+      certificate,
+      score: getCertificateHostnameScore(certificate, hostname)
+    }))
+    .filter((entry) => entry.score > 0 && new Date(entry.certificate.expiresAt).getTime() > now)
+    .sort((a, b) =>
+      b.score - a.score ||
+      new Date(b.certificate.expiresAt).getTime() - new Date(a.certificate.expiresAt).getTime()
+    );
+  return candidates[0]?.certificate ?? null;
+}
+
+function getCertificateHostnameScore(certificate: AcmeCertificate, hostname: string) {
+  let best = 0;
+  for (const domain of certificate.domains) {
+    if (domain === hostname) {
+      best = Math.max(best, 10_000 + domain.length);
+      continue;
+    }
+    if (matchesWildcardDomain(domain, hostname)) {
+      best = Math.max(best, 1_000 + domain.length);
+    }
+  }
+  return best;
+}
+
+function matchesWildcardDomain(pattern: string, hostname: string) {
+  if (!pattern.startsWith("*.")) {
+    return false;
+  }
+  const base = pattern.slice(2);
+  if (!hostname.endsWith(`.${base}`)) {
+    return false;
+  }
+  return hostname.split(".").length === base.split(".").length + 1;
+}
+
+function pickZoneForHostname<T extends { id: number; name: string }>(hostname: string, zones: T[]) {
   return zones
     .filter((zone) => hostname === zone.name || hostname.endsWith(`.${zone.name}`))
     .sort((a, b) => b.name.length - a.name.length)[0];
@@ -1023,15 +1080,6 @@ function uniqueName(base: string, existing: string[]) {
   return `${base}-${counter}`;
 }
 
-function redactServerCertificate<T extends { privateKeyPem?: string | null }>(value: T | null | undefined): Record<string, unknown> | null {
-  if (!value) {
-    return null;
-  }
-  return {
-    ...value,
-    privateKeyPem: value.privateKeyPem ? "[redacted]" : null
-  };
-}
 
 function analyzeAutomap(
   container: {
@@ -1049,7 +1097,8 @@ function analyzeAutomap(
     protocol: "tcp" | "udp";
     proxyRouteName: string | null;
   }>,
-  defaultInterface: { id: number; address: string } | null
+  defaultInterface: { id: number; address: string } | null,
+  existingRouteNames: string[]
 ) {
   const labels = container.labels ?? {};
   const definitions = new Map<
@@ -1079,80 +1128,82 @@ function analyzeAutomap(
   }
 
   const exposedPorts = [...container.exposedPorts].sort((left, right) => left.privatePort - right.privatePort);
-  const existingNames = existingMappings.map((mapping) => mapping.proxyRouteName).filter(Boolean) as string[];
+  const reservedRouteNames = [...existingRouteNames];
   const sharedDefaults = definitions.get("default");
   const issues: AutomapIssue[] = [];
+  const candidates: AutomapCandidate[] = [];
 
-  const candidates = Array.from(definitions.entries())
-    .filter(([service, definition]) => definition.host || (service === "default" && definition.host))
-    .flatMap(([service, definition]) => {
-      const resolvedDefinition =
-        service !== "default" && sharedDefaults
-          ? {
-              ...sharedDefaults,
-              ...definition
-            }
-          : definition;
+  for (const [service, definition] of definitions.entries()) {
+    if (!definition.host && service !== "default") {
+      continue;
+    }
 
-      if (!resolvedDefinition.host) {
-        return [];
-      }
+    const resolvedDefinition =
+      service !== "default" && sharedDefaults
+        ? {
+            ...sharedDefaults,
+            ...definition
+          }
+        : definition;
 
-      const selectedPort = resolveAutomapPort(exposedPorts, resolvedDefinition, service);
-      if (!selectedPort) {
-        issues.push(resolveAutomapIssue(service, resolvedDefinition, exposedPorts));
-        return [];
-      }
-      if (!defaultInterface) {
-        issues.push({
-          service,
-          severity: "error",
-          code: "mapping_failed",
-          message: "No default network interface configured for automapping.",
-          labels: automapLabelRefs(service, []),
-          signature: `${service}:missing_default_interface`
-        });
-        return [];
-      }
+    if (!resolvedDefinition.host) {
+      continue;
+    }
 
-      const routeProtocol = resolveAutomapRouteProtocol(service, resolvedDefinition, selectedPort, exposedPorts);
-      const mappingProtocol = routeProtocol === "udp" ? "udp" : "tcp";
-      if (selectedPort.protocol !== mappingProtocol) {
-        issues.push({
-          service,
-          severity: "error",
-          code: "protocol_mismatch",
-          message: `Port ${selectedPort.privatePort}/${selectedPort.protocol} cannot be mapped as ${routeProtocol.toUpperCase()}.`,
-          labels: automapLabelRefs(service, resolvedDefinition.protocol ? ["protocol", "port"] : ["port"]),
-          signature: `${service}:protocol_mismatch:${selectedPort.privatePort}:${routeProtocol}:${selectedPort.protocol}`
-        });
-        return [];
-      }
+    const selectedPort = resolveAutomapPort(exposedPorts, resolvedDefinition, service);
+    if (!selectedPort) {
+      issues.push(resolveAutomapIssue(service, resolvedDefinition, exposedPorts));
+      continue;
+    }
+    if (!defaultInterface) {
+      issues.push({
+        service,
+        severity: "error",
+        code: "mapping_failed",
+        message: "No default network interface configured for automapping.",
+        labels: automapLabelRefs(service, []),
+        signature: `${service}:missing_default_interface`
+      });
+      continue;
+    }
 
-      const baseRouteName = service === "default" ? container.name : `${container.name}-${sanitizeServiceName(service)}`;
-      const routeName = uniqueName(baseRouteName, existingNames);
-      const existing = existingMappings.find(
-        (mapping) => mapping.privatePort === selectedPort.privatePort && mapping.protocol === selectedPort.protocol
-      );
+    const routeProtocol = resolveAutomapRouteProtocol(service, resolvedDefinition, selectedPort, exposedPorts);
+    const mappingProtocol = routeProtocol === "udp" ? "udp" : "tcp";
+    if (selectedPort.protocol !== mappingProtocol) {
+      issues.push({
+        service,
+        severity: "error",
+        code: "protocol_mismatch",
+        message: `Port ${selectedPort.privatePort}/${selectedPort.protocol} cannot be mapped as ${routeProtocol.toUpperCase()}.`,
+        labels: automapLabelRefs(service, resolvedDefinition.protocol ? ["protocol", "port"] : ["port"]),
+        signature: `${service}:protocol_mismatch:${selectedPort.privatePort}:${routeProtocol}:${selectedPort.protocol}`
+      });
+      continue;
+    }
 
-      return [
-        {
-          service,
-          dnsName: normalizeDnsName(resolvedDefinition.host),
-          routeProtocol,
-          privatePort: selectedPort.privatePort,
-          protocol: selectedPort.protocol,
-          publicPort: selectedPort.publishedBindings[0]?.publicPort ?? null,
-          routeName,
-          ...resolveAutomapListener(routeProtocol, selectedPort.privatePort, defaultInterface.address, defaultInterface.id),
-          sourcePath: routeProtocol === "http" || routeProtocol === "https" ? "/" : null,
-          preserveHost: routeProtocol === "http" || routeProtocol === "https",
-          enabled: true,
-          alreadyMapped: Boolean(existing),
-          existingRouteName: existing?.proxyRouteName ?? null
-        } satisfies AutomapCandidate
-      ];
-    });
+    const baseRouteName = service === "default" ? container.name : `${container.name}-${sanitizeServiceName(service)}`;
+    const routeName = uniqueName(baseRouteName, reservedRouteNames);
+    reservedRouteNames.push(routeName);
+    const existing = existingMappings.find(
+      (mapping) => mapping.privatePort === selectedPort.privatePort && mapping.protocol === selectedPort.protocol
+    );
+
+    candidates.push({
+      service,
+      dnsName: normalizeDnsName(resolvedDefinition.host),
+      routeProtocol,
+      privatePort: selectedPort.privatePort,
+      protocol: selectedPort.protocol,
+      publicPort: selectedPort.publishedBindings[0]?.publicPort ?? null,
+      routeName,
+      ...resolveAutomapListener(routeProtocol, selectedPort.privatePort, defaultInterface.address, defaultInterface.id),
+      sourcePath: routeProtocol === "http" || routeProtocol === "https" ? "/" : null,
+      preserveHost: routeProtocol === "http" || routeProtocol === "https",
+      enabled: true,
+      alreadyMapped: Boolean(existing),
+      existingRouteName: existing?.proxyRouteName ?? null
+    } satisfies AutomapCandidate);
+  }
 
   return {
     candidates,

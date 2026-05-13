@@ -112,6 +112,7 @@ export function createCloudflareRouter(repositories: Repositories) {
         name,
         kind: "local" as const,
         description: `Imported from Cloudflare (${cred.name})`,
+        cloudflareCredentialId: cred.id,
         isPrimary: false,
         isReverse: false,
         ttl: 300,
@@ -146,6 +147,10 @@ export function createCloudflareRouter(repositories: Repositories) {
     const acmeCerts = await repositories.acmeCertificates.list();
     if (acmeCerts.some((c) => c.cloudflareCredentialId === id)) {
       throw AppError.conflict("Credential is in use by ACME certificates");
+    }
+    const zones = await repositories.zones.list();
+    if (zones.some((zone) => zone.cloudflareCredentialId === id)) {
+      throw AppError.conflict("Credential is linked to imported DNS zones");
     }
     await repositories.cloudflareCredentials.delete(id);
     await repositories.audit.create({

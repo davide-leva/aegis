@@ -152,6 +152,8 @@ export interface DnsZone {
   name: string;
   kind: "local" | "forward";
   description: string | null;
+  cloudflareCredentialId: number | null;
+  cloudflareCredentialName: string | null;
   isPrimary: boolean;
   isReverse: boolean;
   ttl: number;

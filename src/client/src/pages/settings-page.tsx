@@ -451,7 +451,7 @@ function DeleteCredentialDialog({
           <DialogTitle>Delete credential</DialogTitle>
         </DialogHeader>
         <p className="text-sm text-muted-foreground py-2">
-          Delete <span className="font-medium text-foreground">"{credential.name}"</span>? This will fail if any ACME certificates are using it.
+          Delete <span className="font-medium text-foreground">"{credential.name}"</span>? This will fail if any ACME certificates or imported DNS zones are using it.
         </p>
         <DialogFooter>
           <Button variant="secondary" onClick={onClose} disabled={isPending}>Cancel</Button>

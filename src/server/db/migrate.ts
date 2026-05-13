@@ -19,6 +19,7 @@ export async function migrate(db: DatabaseContext) {
       name TEXT NOT NULL UNIQUE,
       kind TEXT NOT NULL,
       description TEXT,
+      cloudflare_credential_id INTEGER,
       is_primary INTEGER NOT NULL DEFAULT 1,
       is_reverse INTEGER NOT NULL DEFAULT 0,
       ttl INTEGER NOT NULL,
@@ -310,6 +311,7 @@ export async function migrate(db: DatabaseContext) {
       name TEXT NOT NULL UNIQUE,
       kind TEXT NOT NULL,
       description TEXT,
+      cloudflare_credential_id INTEGER,
       is_primary BOOLEAN NOT NULL DEFAULT TRUE,
       is_reverse BOOLEAN NOT NULL DEFAULT FALSE,
       ttl INTEGER NOT NULL,
@@ -582,13 +584,15 @@ export async function migrate(db: DatabaseContext) {
           `ALTER TABLE certificate_authorities ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT FALSE`,
           `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER REFERENCES certificate_subjects(id) ON DELETE RESTRICT`,
           `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER REFERENCES network_interfaces(id) ON DELETE SET NULL`,
-          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`
+          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`,
+          `ALTER TABLE dns_zones ADD COLUMN cloudflare_credential_id INTEGER`
         ]
       : [
           `ALTER TABLE certificate_authorities ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0`,
           `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER`,
           `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER`,
-          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`
+          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`,
+          `ALTER TABLE dns_zones ADD COLUMN cloudflare_credential_id INTEGER`
         ];
 
   for (const statement of alterStatements) {

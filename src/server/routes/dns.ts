@@ -33,6 +33,7 @@ const zoneSchema = z.object({
   name: z.string().min(2).regex(/^[a-zA-Z0-9.-]+$/),
   kind: z.enum(["local", "forward"]),
   description: z.string().max(280).nullable(),
+  cloudflareCredentialId: z.number().int().positive().nullable().default(null),
   isPrimary: z.boolean(),
   isReverse: z.boolean(),
   ttl: z.number().int().min(60).max(86400),

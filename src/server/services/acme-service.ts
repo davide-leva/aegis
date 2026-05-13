@@ -21,6 +21,8 @@ type OrderMaterial = {
 
 type ProgressFn = (step: string, status: "running" | "done" | "error", detail?: string) => void;
 
+export type AcmeOrderMaterial = OrderMaterial;
+
 export class AcmeService {
   constructor(
     private readonly repositories: Repositories,
@@ -199,69 +201,78 @@ export class AcmeService {
     domains: string[],
     progress?: ProgressFn
   ): Promise<OrderMaterial> {
-    if (!account.accountUrl) throw new Error("ACME account has no registered URL — delete and re-create the account");
-    const client = new acme.Client({
-      directoryUrl: account.directoryUrl,
-      accountKey: account.accountKeyPem,
-      accountUrl: account.accountUrl
-    });
+    return issueAcmeOrderMaterial(account, cred, domains, progress);
+  }
+}
 
-    progress?.("Generating key and CSR", "running");
-    const [privateKey, csr] = await acme.crypto.createCsr({ altNames: domains });
-    progress?.("Generating key and CSR", "done");
+export async function issueAcmeOrderMaterial(
+  account: AcmeAccount,
+  cred: CloudflareCredential,
+  domains: string[],
+  progress?: ProgressFn
+): Promise<OrderMaterial> {
+  if (!account.accountUrl) throw new Error("ACME account has no registered URL — delete and re-create the account");
+  const client = new acme.Client({
+    directoryUrl: account.directoryUrl,
+    accountKey: account.accountKeyPem,
+    accountUrl: account.accountUrl
+  });
 
-    progress?.("Creating ACME order", "running");
-    const order = await client.createOrder({
-      identifiers: domains.map((d) => ({ type: "dns", value: d }))
-    });
-    progress?.("Creating ACME order", "done");
+  progress?.("Generating key and CSR", "running");
+  const [privateKey, csr] = await acme.crypto.createCsr({ altNames: domains });
+  progress?.("Generating key and CSR", "done");
 
-    const authorizations = await client.getAuthorizations(order);
-    const cleanups: Array<() => Promise<void>> = [];
+  progress?.("Creating ACME order", "running");
+  const order = await client.createOrder({
+    identifiers: domains.map((d) => ({ type: "dns", value: d }))
+  });
+  progress?.("Creating ACME order", "done");
 
-    try {
-      for (const auth of authorizations) {
-        const domain = auth.identifier.value;
-        const challenge = auth.challenges.find((c) => c.type === "dns-01");
-        if (!challenge) throw new Error(`No DNS-01 challenge for ${domain}`);
+  const authorizations = await client.getAuthorizations(order);
+  const cleanups: Array<() => Promise<void>> = [];
 
-        progress?.(`DNS-01 challenge: ${domain}`, "running", "Adding TXT record to Cloudflare");
-        const keyAuth = await client.getChallengeKeyAuthorization(challenge);
-        const txtName = `_acme-challenge.${domain}`;
-        const recordRef = await cloudflarePutTxt(cred.apiToken, txtName, keyAuth);
-        cleanups.push(() => cloudflareDeleteTxt(cred.apiToken, recordRef));
+  try {
+    for (const auth of authorizations) {
+      const domain = auth.identifier.value;
+      const challenge = auth.challenges.find((c) => c.type === "dns-01");
+      if (!challenge) throw new Error(`No DNS-01 challenge for ${domain}`);
 
-        progress?.(`DNS-01 challenge: ${domain}`, "running", `Waiting ${DNS_PROPAGATION_WAIT_MS / 1000}s for DNS propagation`);
-        await wait(DNS_PROPAGATION_WAIT_MS);
+      progress?.(`DNS-01 challenge: ${domain}`, "running", "Adding TXT record to Cloudflare");
+      const keyAuth = await client.getChallengeKeyAuthorization(challenge);
+      const txtName = `_acme-challenge.${domain}`;
+      const recordRef = await cloudflarePutTxt(cred.apiToken, txtName, keyAuth);
+      cleanups.push(() => cloudflareDeleteTxt(cred.apiToken, recordRef));
 
-        progress?.(`DNS-01 challenge: ${domain}`, "running", "Completing challenge");
-        await client.completeChallenge(challenge);
-        await client.waitForValidStatus(challenge);
-        progress?.(`DNS-01 challenge: ${domain}`, "done");
-      }
+      progress?.(`DNS-01 challenge: ${domain}`, "running", `Waiting ${DNS_PROPAGATION_WAIT_MS / 1000}s for DNS propagation`);
+      await wait(DNS_PROPAGATION_WAIT_MS);
 
-      progress?.("Finalizing order and fetching certificate", "running");
-      await client.finalizeOrder(order, csr);
-      const chain = await client.getCertificate(order);
-      progress?.("Finalizing order and fetching certificate", "done");
+      progress?.(`DNS-01 challenge: ${domain}`, "running", "Completing challenge");
+      await client.completeChallenge(challenge);
+      await client.waitForValidStatus(challenge);
+      progress?.(`DNS-01 challenge: ${domain}`, "done");
+    }
 
-      const certs = splitChain(chain);
-      const leafPem = certs[0] ?? chain;
-      const chainPem = certs.slice(1).join("\n") || chain;
-      const { serialNumber, issuedAt, expiresAt } = parseCertDates(leafPem);
+    progress?.("Finalizing order and fetching certificate", "running");
+    await client.finalizeOrder(order, csr);
+    const chain = await client.getCertificate(order);
+    progress?.("Finalizing order and fetching certificate", "done");
 
-      return {
-        certificatePem: leafPem,
-        privateKeyPem: privateKey.toString(),
-        chainPem,
-        serialNumber,
-        issuedAt,
-        expiresAt
-      };
-    } finally {
-      for (const cleanup of cleanups) {
-        await cleanup().catch((err) => console.error("DNS cleanup failed:", err));
-      }
+    const certs = splitChain(chain);
+    const leafPem = certs[0] ?? chain;
+    const chainPem = certs.slice(1).join("\n") || chain;
+    const { serialNumber, issuedAt, expiresAt } = parseCertDates(leafPem);
+
+    return {
+      certificatePem: leafPem,
+      privateKeyPem: privateKey.toString(),
+      chainPem,
+      serialNumber,
+      issuedAt,
+      expiresAt
+    };
+  } finally {
+    for (const cleanup of cleanups) {
+      await cleanup().catch((err) => console.error("DNS cleanup failed:", err));
     }
   }
 }
