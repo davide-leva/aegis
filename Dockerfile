@@ -22,5 +22,5 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/src/client/dist ./src/client/dist
 COPY .env.example ./.env.example
-EXPOSE 4000
+EXPOSE 5000
 CMD ["npm", "run", "start"]
