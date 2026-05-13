@@ -66,7 +66,19 @@ export type AuditAction =
   | "docker.mapping.delete"
   | "docker.mapping.automap"
   | "network.interface.list"
-  | "network.interface.sync";
+  | "network.interface.sync"
+  | "api_key.create"
+  | "api_key.delete"
+  | "cloudflare.credential.create"
+  | "cloudflare.credential.update"
+  | "cloudflare.credential.delete"
+  | "cloudflare.zones.import"
+  | "acme.account.create"
+  | "acme.account.delete"
+  | "acme.certificate.issue"
+  | "acme.certificate.renew"
+  | "acme.certificate.delete"
+  | "proxy.health.checked";
 
 export type EventTopic =
   | "dns.bootstrap.completed"
@@ -107,7 +119,10 @@ export type EventTopic =
   | "docker.mapping.created"
   | "docker.mapping.automapped"
   | "docker.mapping.automap_failed"
-  | "docker.mapping.deleted";
+  | "docker.mapping.deleted"
+  | "acme.certificate.issued"
+  | "acme.certificate.renewed"
+  | "acme.certificate.deleted";
 
 export interface BootstrapSettings {
   organizationName: string;
@@ -201,8 +216,69 @@ export interface DatabaseContext {
   transaction<T>(callback: (trx: DatabaseContext) => Promise<T>): Promise<T>;
 }
 
+export const API_SCOPES = [
+  "admin",
+  "dns:read", "dns:write",
+  "proxy:read", "proxy:write",
+  "docker:read", "docker:write",
+  "ca:read", "ca:write"
+] as const;
+
+export type ApiScope = typeof API_SCOPES[number];
+
+export interface ApiKey {
+  id: number;
+  name: string;
+  keyHash: string;
+  scopes: ApiScope[];
+  createdBy: number;
+  expiresAt: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CloudflareCredential {
+  id: number;
+  name: string;
+  apiToken: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AcmeAccount {
+  id: number;
+  name: string;
+  email: string;
+  directoryUrl: string;
+  accountKeyPem: string;
+  accountUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AcmeCertificate {
+  id: number;
+  name: string;
+  acmeAccountId: number;
+  acmeAccountName: string;
+  cloudflareCredentialId: number;
+  cloudflareCredentialName: string;
+  domains: string[];
+  certificatePem: string;
+  privateKeyPem: string;
+  chainPem: string;
+  serialNumber: string;
+  issuedAt: string;
+  expiresAt: string;
+  renewalDays: number;
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AuditContext {
-  actorType: "system" | "api_client";
+  actorType: "system" | "user" | "api_client";
   actorId: string;
   sourceIp: string | null;
   userAgent: string | null;
@@ -237,7 +313,7 @@ export interface DnsQueryLogEntry {
   clientIp: string | null;
   questionName: string;
   questionType: string;
-  resolutionMode: "authoritative" | "upstream" | "blocked" | "nxdomain" | "servfail";
+  resolutionMode: "authoritative" | "upstream" | "cached" | "blocked" | "nxdomain" | "servfail";
   responseCode: string;
   answerCount: number;
   durationMs: number;
@@ -250,11 +326,15 @@ export interface DnsRuntimeMetrics {
   totalQueries: number;
   authoritativeQueries: number;
   upstreamQueries: number;
+  cachedQueries: number;
   blockedQueries: number;
   nxDomainQueries: number;
   servfailQueries: number;
   avgDurationMs: number;
   lastQueryAt: string | null;
+  cacheSize: number;
+  cacheHits: number;
+  cacheMisses: number;
 }
 
 export interface DnsRuntimeStatus {
