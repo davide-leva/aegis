@@ -10,9 +10,29 @@ export function getAuditContext(req: Request): AuditContext {
       ? forwarded.split(",")[0]?.trim() ?? null
       : req.ip ?? null;
 
+  const auth = req.auth;
+
+  if (auth?.type === "jwt") {
+    return {
+      actorType: "user",
+      actorId: auth.username,
+      sourceIp,
+      userAgent: req.header("user-agent") ?? null
+    };
+  }
+
+  if (auth?.type === "api_key") {
+    return {
+      actorType: "api_client",
+      actorId: auth.name,
+      sourceIp,
+      userAgent: req.header("user-agent") ?? null
+    };
+  }
+
   return {
-    actorType: req.header("x-aegis-actor-id") ? "api_client" : "system",
-    actorId: req.header("x-aegis-actor-id") ?? "anonymous",
+    actorType: "system",
+    actorId: "anonymous",
     sourceIp,
     userAgent: req.header("user-agent") ?? null
   };
