@@ -25,7 +25,7 @@ Instead of treating ingress, DNS, and service discovery as separate systems, Aeg
 ## Product Preview
 
 <p align="center">
-  <img src="./docs/assets/docker-discovery-preview.svg" alt="Aegis Docker Discovery interface preview" width="100%" />
+  <img src="./docs/assets/docker-discovery-preview.jpg" alt="Aegis Docker Discovery interface preview" width="100%" />
 </p>
 
 The current UI includes dedicated sections for DNS, CA and certificates, proxy management, Docker discovery, mappings, API keys, settings, and system/runtime status.
