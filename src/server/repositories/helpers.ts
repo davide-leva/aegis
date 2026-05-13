@@ -29,6 +29,14 @@ export function mapRows<T extends Record<string, unknown>>(rows: T[]) {
   return rows.map((row) => mapRecord(row) as T);
 }
 
+export function parseJsonArray<T = string>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (typeof value === "string") {
+    try { return JSON.parse(value); } catch { return []; }
+  }
+  return [];
+}
+
 export async function resolveInsertedId(db: DatabaseContext, lastInsertId?: number) {
   if (lastInsertId) {
     return lastInsertId;
