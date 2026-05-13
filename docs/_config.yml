@@ -1,0 +1,6 @@
+title: Aegis
+description: Documentation for the Aegis LAN services control plane
+theme: minima
+markdown: kramdown
+plugins:
+  - jekyll-seo-tag

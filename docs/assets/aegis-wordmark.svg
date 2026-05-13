@@ -1,0 +1,9 @@
+<svg width="640" height="140" viewBox="0 0 640 140" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="640" height="140" rx="24" fill="#0B1220"/>
+  <rect x="28" y="26" width="88" height="88" rx="20" fill="#0F1B2D" stroke="#1C3552"/>
+  <path d="M72 44L88 50V66C88 77.2 81.1 87.2 72 91C62.9 87.2 56 77.2 56 66V50L72 44Z" stroke="#29C3FF" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M72 55V69" stroke="#29C3FF" stroke-width="4" stroke-linecap="round"/>
+  <path d="M66 62H78" stroke="#29C3FF" stroke-width="4" stroke-linecap="round"/>
+  <text x="146" y="64" fill="#29C3FF" font-family="Verdana, Geneva, sans-serif" font-size="22" letter-spacing="7">AEGIS</text>
+  <text x="146" y="98" fill="#E6F4FF" font-family="Verdana, Geneva, sans-serif" font-size="42" font-weight="700" letter-spacing="1.5">Control Plane</text>
+</svg>
