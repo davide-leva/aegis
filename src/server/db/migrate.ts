@@ -227,6 +227,68 @@ export async function migrate(db: DatabaseContext) {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(environment_id) REFERENCES docker_environments(id) ON DELETE CASCADE,
       FOREIGN KEY(proxy_route_id) REFERENCES proxy_routes(id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS api_keys (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      scopes TEXT NOT NULL,
+      created_by INTEGER NOT NULL,
+      expires_at TEXT,
+      last_used_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(created_by) REFERENCES users(id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloudflare_credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      api_token TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS acme_accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL,
+      directory_url TEXT NOT NULL,
+      account_key_pem TEXT NOT NULL,
+      account_url TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS acme_certificates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      acme_account_id INTEGER NOT NULL,
+      cloudflare_credential_id INTEGER NOT NULL,
+      domains TEXT NOT NULL,
+      certificate_pem TEXT NOT NULL,
+      private_key_pem TEXT NOT NULL,
+      chain_pem TEXT NOT NULL,
+      serial_number TEXT NOT NULL,
+      issued_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      renewal_days INTEGER NOT NULL DEFAULT 30,
+      active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(acme_account_id) REFERENCES acme_accounts(id) ON DELETE RESTRICT,
+      FOREIGN KEY(cloudflare_credential_id) REFERENCES cloudflare_credentials(id) ON DELETE RESTRICT
+    )`,
+    `CREATE TABLE IF NOT EXISTS config (
+      group_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_id, key)
     )`
   ];
 
@@ -446,6 +508,65 @@ export async function migrate(db: DatabaseContext) {
       proxy_route_id INTEGER NOT NULL REFERENCES proxy_routes(id) ON DELETE CASCADE,
       created_at TIMESTAMPTZ NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS api_keys (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      key_hash TEXT NOT NULL UNIQUE,
+      scopes JSONB NOT NULL,
+      created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ,
+      last_used_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS cloudflare_credentials (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      api_token TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS acme_accounts (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL,
+      directory_url TEXT NOT NULL,
+      account_key_pem TEXT NOT NULL,
+      account_url TEXT,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS acme_certificates (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      acme_account_id INTEGER NOT NULL REFERENCES acme_accounts(id) ON DELETE RESTRICT,
+      cloudflare_credential_id INTEGER NOT NULL REFERENCES cloudflare_credentials(id) ON DELETE RESTRICT,
+      domains JSONB NOT NULL,
+      certificate_pem TEXT NOT NULL,
+      private_key_pem TEXT NOT NULL,
+      chain_pem TEXT NOT NULL,
+      serial_number TEXT NOT NULL,
+      issued_at TIMESTAMPTZ NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      renewal_days INTEGER NOT NULL DEFAULT 30,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL
+    )`,
+    `CREATE TABLE IF NOT EXISTS config (
+      group_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL,
+      PRIMARY KEY (group_id, key)
     )`
   ];
 
@@ -460,12 +581,14 @@ export async function migrate(db: DatabaseContext) {
       ? [
           `ALTER TABLE certificate_authorities ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT FALSE`,
           `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER REFERENCES certificate_subjects(id) ON DELETE RESTRICT`,
-          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER REFERENCES network_interfaces(id) ON DELETE SET NULL`
+          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER REFERENCES network_interfaces(id) ON DELETE SET NULL`,
+          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`
         ]
       : [
           `ALTER TABLE certificate_authorities ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0`,
           `ALTER TABLE certificate_subjects ADD COLUMN parent_subject_id INTEGER`,
-          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER`
+          `ALTER TABLE proxy_routes ADD COLUMN network_interface_id INTEGER`,
+          `ALTER TABLE acme_accounts ADD COLUMN account_url TEXT`
         ];
 
   for (const statement of alterStatements) {
