@@ -248,23 +248,22 @@ export function SystemPage() {
 
   useEffect(() => {
     if (!interfacesQuery.data) return;
-    setInterfaceItems(
-      interfacesQuery.data.interfaces.length > 0
-        ? interfacesQuery.data.interfaces
-        : interfacesQuery.data.availableInterfaces.map((entry, index) => ({
-            ...entry,
-            enabled: index === 0,
-            isDefault: index === 0
-          }))
-    );
+    setInterfaceItems(buildDiscoveredInterfaceItems(interfacesQuery.data));
   }, [interfacesQuery.data]);
+
+  const refreshInterfaces = async () => {
+    const result = await interfacesQuery.refetch();
+    if (result.data) {
+      setInterfaceItems(buildDiscoveredInterfaceItems(result.data));
+    }
+  };
 
   const actions = (
     <>
       <Tabs value={activeTab} onValueChange={setActiveTab} tabs={systemTabs} />
       {activeTab === "interfaces" ? (
         <>
-          <Button variant="secondary" onClick={() => interfacesQuery.refetch()}>
+          <Button variant="secondary" onClick={() => void refreshInterfaces()}>
             <RefreshCcw className="h-4 w-4" />
             Refresh
           </Button>
@@ -355,6 +354,51 @@ export function SystemPage() {
       ) : null}
     </AppShell>
   );
+}
+
+function buildDiscoveredInterfaceItems(state: NetworkInterfacesState): NetworkInterfaceConfig[] {
+  const configuredByKey = new Map(
+    state.interfaces.map((entry) => [interfaceConfigKey(entry), entry] as const)
+  );
+
+  const discovered = state.availableInterfaces.map((entry, index) => {
+    const configured = configuredByKey.get(interfaceConfigKey(entry));
+    return {
+      ...entry,
+      enabled: configured?.enabled ?? index === 0,
+      isDefault: configured?.isDefault ?? false
+    };
+  });
+
+  if (discovered.length === 0) {
+    return [];
+  }
+
+  const hasEnabled = discovered.some((entry) => entry.enabled);
+  const normalizedEnabled = hasEnabled
+    ? discovered
+    : discovered.map((entry, index) => ({
+        ...entry,
+        enabled: index === 0
+      }));
+
+  const defaultIndex = normalizedEnabled.findIndex((entry) => entry.enabled && entry.isDefault);
+  if (defaultIndex >= 0) {
+    return normalizedEnabled.map((entry, index) => ({
+      ...entry,
+      isDefault: entry.enabled && index === defaultIndex
+    }));
+  }
+
+  const firstEnabledIndex = normalizedEnabled.findIndex((entry) => entry.enabled);
+  return normalizedEnabled.map((entry, index) => ({
+    ...entry,
+    isDefault: entry.enabled && index === firstEnabledIndex
+  }));
+}
+
+function interfaceConfigKey(entry: Pick<NetworkInterfaceConfig, "name" | "address" | "family">) {
+  return `${entry.name}:${entry.address}:${entry.family}`;
 }
 
 // ─── Status panel ─────────────────────────────────────────────────────────────
