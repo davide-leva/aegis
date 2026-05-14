@@ -1,9 +1,4 @@
 services:
-  hello:
-    image: nginxdemos/hello
-    container_name: hello
-    ports:
-      - "8080:80"
   aegis:
     image: ghcr.io/davide-leva/aegis:nightly
     container_name: aegis
