@@ -300,6 +300,7 @@ export class DockerService {
         throw new Error("DNS bootstrap is required before creating Docker mappings");
       }
       const networkInterface = await resolveMappingInterface(repos, input.networkInterfaceId);
+      const proxyDnsInterface = await resolveProxyDnsInterface(repos);
 
       const container = await inspectDockerContainer(environment, input.containerId);
       const target = resolveTarget(container, environment.publicIp, input.privatePort, input.publicPort, input.protocol);
@@ -308,7 +309,7 @@ export class DockerService {
 
       const dnsRecordResult = await ensureDnsRecord(repos, {
         dnsName,
-        value: environment.publicIp,
+        value: proxyDnsInterface.address,
         proxiedService: input.routeName.trim()
       });
       const dnsRecord = dnsRecordResult.record;
@@ -322,6 +323,25 @@ export class DockerService {
         });
         await events.publish({
           topic: "dns.record.created",
+          aggregateType: "dns_record",
+          aggregateId: String(dnsRecord.id),
+          payload: dnsRecord as unknown as Record<string, unknown>,
+          context
+        });
+      }
+      if (dnsRecordResult.updated && dnsRecord?.id) {
+        await repos.audit.create({
+          action: "record.update",
+          entityType: "dns_record",
+          entityId: String(dnsRecord.id),
+          payload: {
+            before: dnsRecordResult.previousRecord ?? null,
+            after: dnsRecord
+          },
+          context
+        });
+        await events.publish({
+          topic: "dns.record.updated",
           aggregateType: "dns_record",
           aggregateId: String(dnsRecord.id),
           payload: dnsRecord as unknown as Record<string, unknown>,
@@ -912,11 +932,31 @@ async function ensureDnsRecord(
   );
   if (existing) {
     if (existing.value !== input.value) {
-      throw new Error(`DNS record ${input.dnsName} already exists with a different address`);
+      if (!existing.proxiedService) {
+        throw new Error(`DNS record ${input.dnsName} already exists with a different address`);
+      }
+      const updated = await repos.records.update(existing.id, {
+        zoneId: existing.zoneId,
+        name: existing.name,
+        type: existing.type,
+        value: input.value,
+        ttl: existing.ttl,
+        priority: existing.priority,
+        proxiedService: input.proxiedService,
+        enabled: existing.enabled
+      });
+      return {
+        record: updated,
+        created: false,
+        updated: true,
+        previousRecord: existing
+      };
     }
     return {
       record: existing,
-      created: false
+      created: false,
+      updated: false,
+      previousRecord: null
     };
   }
 
@@ -933,7 +973,9 @@ async function ensureDnsRecord(
 
   return {
     record: created,
-    created: true
+    created: true,
+    updated: false,
+    previousRecord: null
   };
 }
 
@@ -1209,6 +1251,14 @@ async function resolveMappingInterface(repos: Repositories, networkInterfaceId: 
 
   const fallback = await repos.networkInterfaces.getDefault();
   if (!fallback) {
+    throw new Error("Configure a default network interface before creating Docker mappings");
+  }
+  return fallback;
+}
+
+async function resolveProxyDnsInterface(repos: Repositories) {
+  const fallback = await repos.networkInterfaces.getDefault();
+  if (!fallback || !fallback.enabled) {
     throw new Error("Configure a default network interface before creating Docker mappings");
   }
   return fallback;
