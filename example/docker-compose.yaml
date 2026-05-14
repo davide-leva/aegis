@@ -1,0 +1,13 @@
+services:
+  aegis:
+    image: ghcr.io/davide-leva/aegis:latest
+    container_name: aegis
+    ports:
+      - 53:53/tcp # dns tcp stream
+      - 53:53/udp # dns udp stream
+      - 80:80     # proxies HTTP endpoint
+      - 443:443   # proxies HTTPS endpoint
+      - 5000:5000 # webui dashboard
+    volumes:
+      - ./data:/data
+    restart: always
