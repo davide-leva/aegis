@@ -3,6 +3,7 @@ import { getCanonicalProxyListener } from "../lib/proxy-listeners.js";
 import type { AuditContext, NetworkInterface, ProxyRuntimeStatus } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
 import type { NewProxyRoute } from "../repositories/proxy-route-repository.js";
+import { ensureTlsMaterialForHostname } from "./tls-certificate-selection.js";
 
 interface RuntimeControl {
   requestReload(): void;
@@ -49,13 +50,19 @@ export class ProxyService {
   }
 
   async createRoute(input: NewProxyRoute, context: AuditContext) {
-    const normalizedInput = await normalizeProxyRouteInput(input, this.repositories);
+    const normalizedInput = await resolveProxyRouteTlsMaterial(
+      await normalizeProxyRouteInput(input, this.repositories),
+      this.repositories,
+      this.eventBus,
+      context
+    );
     await this.validateRouteInput(normalizedInput);
     const route = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
       const events = new EventBus(repos);
-      await this.validateRouteInput(normalizedInput, repos);
-      const route = await repos.proxyRoutes.create(normalizedInput);
+      const resolvedInput = await resolveProxyRouteTlsMaterial(normalizedInput, repos, events, context);
+      await this.validateRouteInput(resolvedInput, repos);
+      const route = await repos.proxyRoutes.create(resolvedInput);
       await repos.audit.create({
         action: "proxy.route.create",
         entityType: "proxy_route",
@@ -79,7 +86,12 @@ export class ProxyService {
   }
 
   async updateRoute(id: number, input: NewProxyRoute, context: AuditContext) {
-    const normalizedInput = await normalizeProxyRouteInput(input, this.repositories);
+    const normalizedInput = await resolveProxyRouteTlsMaterial(
+      await normalizeProxyRouteInput(input, this.repositories),
+      this.repositories,
+      this.eventBus,
+      context
+    );
     await this.validateRouteInput(normalizedInput, this.repositories, id);
     const route = await this.repositories.db.transaction(async (trx) => {
       const repos = createRepositories(trx);
@@ -88,8 +100,9 @@ export class ProxyService {
       if (!existing) {
         throw new Error("Proxy route not found");
       }
-      await this.validateRouteInput(normalizedInput, repos, id);
-      const route = await repos.proxyRoutes.update(id, normalizedInput);
+      const resolvedInput = await resolveProxyRouteTlsMaterial(normalizedInput, repos, events, context);
+      await this.validateRouteInput(resolvedInput, repos, id);
+      const route = await repos.proxyRoutes.update(id, resolvedInput);
       await repos.audit.create({
         action: "proxy.route.update",
         entityType: "proxy_route",
@@ -281,6 +294,42 @@ export class ProxyService {
       }
     }
   }
+}
+
+async function resolveProxyRouteTlsMaterial(
+  input: NewProxyRoute,
+  repos: Repositories,
+  events: EventBus,
+  context: AuditContext
+) {
+  if (input.protocol !== "https") {
+    return input;
+  }
+
+  if (input.tlsCertPem && input.tlsKeyPem) {
+    return input;
+  }
+
+  const hostname = normalizeHost(input.sourceHost);
+  if (!hostname) {
+    return input;
+  }
+
+  const material = await ensureTlsMaterialForHostname(
+    repos,
+    events,
+    {
+      dnsName: hostname,
+      routeName: input.name.trim()
+    },
+    context
+  );
+
+  return {
+    ...input,
+    tlsCertPem: material.certificatePem,
+    tlsKeyPem: material.privateKeyPem
+  };
 }
 
 async function normalizeProxyRouteInput(input: NewProxyRoute, repos: Repositories): Promise<NewProxyRoute> {

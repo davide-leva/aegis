@@ -172,7 +172,7 @@ type AcmeCertificate = {
   active: boolean;
 };
 
-type HttpsCertificateMode = "existing" | "quick" | "current";
+type HttpsCertificateMode = "automatic" | "existing" | "quick" | "current";
 
 const HTTP_LISTENER = { address: "0.0.0.0", port: 80 };
 const HTTPS_LISTENER = { address: "0.0.0.0", port: 443 };
@@ -636,7 +636,7 @@ function ProxyRouteDialog({
     ? "existing"
     : hasCurrentTlsMaterial
       ? "current"
-      : "existing";
+      : "automatic";
   const [httpsCertificateMode, setHttpsCertificateMode] = useState<HttpsCertificateMode>(defaultHttpsMode);
   const [selectedCertId, setSelectedCertId] = useState<string>(defaultCertId);
   const activeCertificateAuthorities = certificateAuthorities.filter((authority) => authority.active);
@@ -819,12 +819,21 @@ function ProxyRouteDialog({
                   value={httpsCertificateMode}
                   onValueChange={(value) => setHttpsCertificateMode(value as HttpsCertificateMode)}
                   tabs={[
+                    { value: "automatic", label: "Automatic" },
                     { value: "existing", label: "Existing cert" },
                     { value: "quick", label: "Quick issue" },
                     ...(hasCurrentTlsMaterial && !matchingCurrentCertificate ? [{ value: "current", label: "Keep current" }] : [])
                   ]}
                 />
               </Field>
+              {httpsCertificateMode === "automatic" ? (
+                <div className="rounded-md border border-input bg-secondary/50 px-3 py-3 md:col-span-2">
+                  <p className="text-sm font-medium text-foreground">Automatic certificate selection</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Aegis reuses a matching server certificate by SAN first, then a matching ACME certificate for managed public zones, and otherwise issues a new internal certificate from an active Root CA.
+                  </p>
+                </div>
+              ) : null}
               {httpsCertificateMode === "existing" ? (
                 <Field label="TLS certificate" className="md:col-span-2">
                   <Select value={selectedCertId} onValueChange={setSelectedCertId}>
@@ -957,6 +966,10 @@ async function buildRoutePayloadFromDialog(
   }
 ) {
   if (values.protocol !== "https") {
+    return { ...values, tlsCertPem: "", tlsKeyPem: "" };
+  }
+
+  if (options.httpsCertificateMode === "automatic") {
     return { ...values, tlsCertPem: "", tlsKeyPem: "" };
   }
 
