@@ -251,12 +251,19 @@ export function SystemPage() {
     setInterfaceItems(buildDiscoveredInterfaceItems(interfacesQuery.data));
   }, [interfacesQuery.data]);
 
+  const refreshInterfaces = async () => {
+    const result = await interfacesQuery.refetch();
+    if (result.data) {
+      setInterfaceItems(buildDiscoveredInterfaceItems(result.data));
+    }
+  };
+
   const actions = (
     <>
       <Tabs value={activeTab} onValueChange={setActiveTab} tabs={systemTabs} />
       {activeTab === "interfaces" ? (
         <>
-          <Button variant="secondary" onClick={() => interfacesQuery.refetch()}>
+          <Button variant="secondary" onClick={() => void refreshInterfaces()}>
             <RefreshCcw className="h-4 w-4" />
             Refresh
           </Button>
