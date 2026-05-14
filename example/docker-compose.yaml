@@ -2,12 +2,15 @@ services:
   aegis:
     image: ghcr.io/davide-leva/aegis:nightly
     container_name: aegis
-    ports:
-      - 53:53/tcp # dns tcp stream
-      - 53:53/udp # dns udp stream
-      - 80:80     # proxies HTTP endpoint
-      - 443:443   # proxies HTTPS endpoint
-      - 5000:5000 # webui dashboard
+    network_mode: host
+    # use ports if you run the container without
+    # the host network mode
+    # ports:
+    #   - 53:53/tcp # dns tcp stream
+    #   - 53:53/udp # dns udp stream
+    #   - 80:80     # proxies HTTP endpoint
+    #   - 443:443   # proxies HTTPS endpoint
+    #   - 5000:5000 # webui dashboard
     volumes:
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
