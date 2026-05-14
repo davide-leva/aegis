@@ -1,17 +1,14 @@
 import { EventBus } from "../events/event-bus.js";
 import { getCanonicalProxyListener } from "../lib/proxy-listeners.js";
-import { generateServerCertificate } from "../lib/pki.js";
 import { getEnvironmentResourceStats, inspectDockerContainer, listDockerContainers, watchDockerContainerEvents } from "../lib/docker-api.js";
 import type { DockerContainerEvent } from "../lib/docker-api.js";
-import { issueAcmeOrderMaterial } from "./acme-service.js";
 import type { AcmeCertificate, AuditContext, DockerEnvironment as DockerEnvironmentEntity, ServerCertificate } from "../types.js";
 import { createRepositories, type Repositories } from "../repositories/index.js";
 import type { NewDockerEnvironment } from "../repositories/docker-environment-repository.js";
 import type { NewDockerPortMapping } from "../repositories/docker-port-mapping-repository.js";
 import type { NewProxyRoute } from "../repositories/proxy-route-repository.js";
 import type { NewRecord } from "../repositories/dns-record-repository.js";
-import type { NewServerCertificate } from "../repositories/server-certificate-repository.js";
-import type { NewCertificateSubject } from "../repositories/certificate-subject-repository.js";
+import { ensureTlsMaterialForHostname } from "./tls-certificate-selection.js";
 
 interface ProxyRuntimeControl {
   requestReload(): void;
@@ -334,11 +331,11 @@ export class DockerService {
 
       const serverCertificate =
         protocol === "https"
-          ? await ensureHttpsCertificateForHostname(
+          ? await ensureTlsMaterialForHostname(
               repos,
               events,
               {
-              dnsName,
+                dnsName,
                 routeName: input.routeName.trim()
               },
               context
@@ -938,206 +935,6 @@ async function ensureDnsRecord(
     record: created,
     created: true
   };
-}
-
-async function ensureHttpsCertificateForHostname(
-  repos: Repositories,
-  events: EventBus,
-  input: {
-    dnsName: string;
-    routeName: string;
-  },
-  context: AuditContext
-) {
-  const existingServerCertificate = await findBestServerCertificateForHostname(repos, input.dnsName);
-  if (existingServerCertificate) {
-    return existingServerCertificate;
-  }
-
-  const existing = await findBestAcmeCertificateForHostname(repos, input.dnsName);
-  if (existing) {
-    return existing;
-  }
-
-  const zone = await resolveManagedZoneForHostname(repos, input.dnsName);
-  if (!zone) {
-    throw new Error(`No managed DNS zone matches ${input.dnsName}. Create a local zone or import the zone before creating an HTTPS mapping.`);
-  }
-
-  if (!zone.cloudflareCredentialId) {
-    return issueInternalServerCertificateForHostname(repos, events, input, context);
-  }
-
-  const [account, credential] = await Promise.all([
-    resolveAcmeAccount(repos),
-    repos.cloudflareCredentials.getById(zone.cloudflareCredentialId)
-  ]);
-  if (!account) {
-    throw new Error("No ACME account configured. Create an ACME account before creating HTTPS mappings.");
-  }
-  if (!credential) {
-    throw new Error(`Cloudflare credential ${zone.cloudflareCredentialId} for zone ${zone.name} was not found`);
-  }
-
-  const material = await issueAcmeOrderMaterial(account, credential, [input.dnsName]);
-  const created = await repos.acmeCertificates.create({
-    name: uniqueName(`${input.routeName}-tls`, (await repos.acmeCertificates.list()).map((item) => item.name)),
-    acmeAccountId: account.id,
-    cloudflareCredentialId: credential.id,
-    domains: [input.dnsName],
-    certificatePem: material.certificatePem,
-    privateKeyPem: material.privateKeyPem,
-    chainPem: material.chainPem,
-    serialNumber: material.serialNumber,
-    issuedAt: material.issuedAt,
-    expiresAt: material.expiresAt,
-    renewalDays: 30,
-    active: true
-  });
-
-  await repos.audit.create({
-    action: "acme.certificate.issue",
-    entityType: "acme_certificate",
-    entityId: String(created.id),
-    payload: { name: created.name, domains: created.domains, expiresAt: created.expiresAt },
-    context
-  });
-  await events.publish({
-    topic: "acme.certificate.issued",
-    aggregateType: "acme_certificate",
-    aggregateId: String(created.id),
-    payload: { name: created.name, domains: created.domains, expiresAt: created.expiresAt },
-    context
-  });
-
-  return created;
-}
-
-async function resolveManagedZoneForHostname(repos: Repositories, hostname: string) {
-  const zones = (await repos.zones.list()).filter((zone) => zone.enabled && zone.kind === "local");
-  return pickZoneForHostname(hostname, zones);
-}
-
-async function issueInternalServerCertificateForHostname(
-  repos: Repositories,
-  events: EventBus,
-  input: {
-    dnsName: string;
-    routeName: string;
-  },
-  context: AuditContext
-) {
-  const authority = await resolveDefaultRootCertificateAuthority(repos);
-  if (!authority) {
-    throw new Error("No default Root CA configured. Create or bootstrap a local Root CA before creating HTTPS mappings for local zones.");
-  }
-
-  const subject = await ensureServerCertificateSubject(repos, authority.subjectId, input.dnsName);
-  if (!subject) {
-    throw new Error(`Failed to create certificate subject for ${input.dnsName}`);
-  }
-  const material = await generateServerCertificate({
-    subject: {
-      commonName: subject.commonName,
-      organization: subject.organization,
-      organizationalUnit: subject.organizationalUnit,
-      country: subject.country,
-      state: subject.state,
-      locality: subject.locality,
-      emailAddress: subject.emailAddress
-    },
-    validityDays: 397,
-    subjectAltNames: [input.dnsName],
-    issuer: {
-      certificatePem: authority.certificatePem,
-      privateKeyPem: authority.privateKeyPem
-    }
-  });
-
-  const created = await repos.serverCertificates.create({
-    name: uniqueName(`${input.routeName}-tls`, (await repos.serverCertificates.list()).map((item) => item.name)),
-    subjectId: subject.id,
-    caId: authority.id,
-    subjectAltNames: [input.dnsName],
-    certificatePem: material.certificatePem,
-    privateKeyPem: material.privateKeyPem,
-    chainPem: material.chainPem,
-    serialNumber: material.serialNumber,
-    issuedAt: material.issuedAt,
-    expiresAt: material.expiresAt,
-    validityDays: 397,
-    renewalDays: 30,
-    active: true
-  } satisfies NewServerCertificate);
-  if (!created) {
-    throw new Error(`Failed to create server certificate for ${input.dnsName}`);
-  }
-
-  await repos.audit.create({
-    action: "certificate.server.create",
-    entityType: "server_certificate",
-    entityId: String(created.id),
-    payload: {
-      ...created,
-      privateKeyPem: "[redacted]"
-    },
-    context
-  });
-  await events.publish({
-    topic: "certificate.server.created",
-    aggregateType: "server_certificate",
-    aggregateId: String(created.id),
-    payload: {
-      ...created,
-      privateKeyPem: "[redacted]"
-    },
-    context
-  });
-
-  return created;
-}
-
-async function resolveDefaultRootCertificateAuthority(repos: Repositories) {
-  const direct = await repos.certificateAuthorities.getDefaultRoot();
-  if (direct && direct.active && direct.isSelfSigned) {
-    return direct;
-  }
-  const fallback = (await repos.certificateAuthorities.list()).find((authority) => authority.active && authority.isSelfSigned);
-  if (!fallback) {
-    return null;
-  }
-  if (!direct || direct.id !== fallback.id) {
-    await repos.certificateAuthorities.setDefaultRoot(fallback.id);
-    return repos.certificateAuthorities.getById(fallback.id);
-  }
-  return fallback;
-}
-
-async function ensureServerCertificateSubject(repos: Repositories, parentSubjectId: number, dnsName: string) {
-  const existing = (await repos.certificateSubjects.list()).find(
-    (subject) => subject.parentSubjectId === parentSubjectId && subject.commonName.toLowerCase() === dnsName.toLowerCase()
-  );
-  if (existing) {
-    return existing;
-  }
-
-  return repos.certificateSubjects.create({
-    name: uniqueName(dnsName, (await repos.certificateSubjects.list()).map((item) => item.name)),
-    parentSubjectId,
-    parentSubjectName: null,
-    commonName: dnsName,
-    organization: null,
-    organizationalUnit: null,
-    country: null,
-    state: null,
-    locality: null,
-    emailAddress: null
-  } satisfies NewCertificateSubject);
-}
-
-async function resolveAcmeAccount(repos: Repositories) {
-  const accounts = await repos.acmeAccounts.list();
-  return accounts[0] ?? null;
 }
 
 async function findBestAcmeCertificateForHostname(repos: Repositories, hostname: string) {

@@ -25,7 +25,7 @@ import { MetricCard } from "@/components/ui/metric-card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Tabs } from "@/components/ui/tabs";
-import { api } from "@/lib/api";
+import { api, downloadFile } from "@/lib/api";
 import { useToast } from "@/hooks/use-toast";
 import { humanizeError } from "@/lib/errors";
 import { useAcmeProgress } from "@/hooks/use-acme-progress";
@@ -561,7 +561,7 @@ export function CertificatesPage() {
                   >
                     <RotateCw className="h-4 w-4" />
                   </Button>
-                  <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/acme/certificates/${cert.id}/download`)} />
+                  <DownloadButton label="Certificate" onClick={() => downloadPem(`/api/acme/certificates/${cert.id}/download?kind=certificate`)} />
                   <DeleteDialog
                     title="Delete certificate"
                     description={`Permanently remove "${cert.name}". The certificate will be revoked with the CA.`}
@@ -1331,20 +1331,5 @@ function subjectToForm(subject: CertificateSubject): SubjectForm {
 }
 
 async function downloadPem(path: string) {
-  const response = await fetch(path);
-  if (!response.ok) {
-    throw new Error("Download failed");
-  }
-  const blob = await response.blob();
-  const disposition = response.headers.get("Content-Disposition") ?? "";
-  const match = disposition.match(/filename=\"([^\"]+)\"/);
-  const fileName = match?.[1] ?? "certificate.pem";
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
+  await downloadFile(path);
 }
