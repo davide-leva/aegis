@@ -1,6 +1,11 @@
 services:
+  hello:
+    image: nginxdemos/hello
+    container_name: hello
+    ports:
+      - "8080:80"
   aegis:
-    image: ghcr.io/davide-leva/aegis:latest
+    image: ghcr.io/davide-leva/aegis:nightly
     container_name: aegis
     ports:
       - 53:53/tcp # dns tcp stream
@@ -10,4 +15,5 @@ services:
       - 5000:5000 # webui dashboard
     volumes:
       - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: always

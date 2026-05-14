@@ -356,7 +356,7 @@ function DockerWorkspace() {
             submitLabel="Create environment"
             loading={createEnvironmentMutation.isPending}
             error={dialogError}
-            onSubmit={(values) => createEnvironmentMutation.mutate(values)}
+            onSubmit={(values) => createEnvironmentMutation.mutateAsync(values)}
             trigger={
               <Button>
                 <Plus className="h-4 w-4" />
@@ -424,7 +424,7 @@ function DockerWorkspace() {
                               loading={updateEnvironmentMutation.isPending}
                               error={dialogError}
                               initialValues={environmentToForm(environment)}
-                              onSubmit={(values) => updateEnvironmentMutation.mutate({ id: environment.id, payload: values })}
+                              onSubmit={(values) => updateEnvironmentMutation.mutateAsync({ id: environment.id, payload: values })}
                               trigger={
                                 <Button variant="ghost" className="h-9 w-9 p-0">
                                   <Pencil className="h-4 w-4" />
@@ -830,7 +830,7 @@ function EnvironmentDialog({
   loading: boolean;
   error: string | null;
   initialValues?: EnvironmentForm;
-  onSubmit: (values: EnvironmentForm) => void;
+  onSubmit: (values: EnvironmentForm) => Promise<void>;
   trigger: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -863,8 +863,8 @@ function EnvironmentDialog({
         </DialogHeader>
         <form
           className="grid gap-4 md:grid-cols-2"
-          onSubmit={handleSubmit((values) => {
-            onSubmit(values);
+          onSubmit={handleSubmit(async (values) => {
+            await onSubmit(values);
             setOpen(false);
           })}
         >
@@ -886,6 +886,9 @@ function EnvironmentDialog({
           {connectionType === "local_socket" ? (
             <Field label="Socket path" className="md:col-span-2">
               <Input {...register("socketPath")} />
+              <p className="mt-1 text-xs text-muted-foreground">
+                If Aegis runs in Docker, mount the host socket into this container at the same path.
+              </p>
             </Field>
           ) : (
             <>
@@ -902,8 +905,18 @@ function EnvironmentDialog({
               </Field>
             </>
           )}
-          <Field label="Public IP" className="md:col-span-2">
-            <Input placeholder="203.0.113.10" {...register("publicIp")} />
+          <Field label="Public IP of Docker host" className="md:col-span-2" error={envErrors.publicIp?.message}>
+            <Input
+              placeholder="203.0.113.10"
+              {...register("publicIp", {
+                required: "Public IP is required",
+                minLength: { value: 3, message: "Enter a valid IP or hostname" },
+                maxLength: { value: 255, message: "Max 255 characters" }
+              })}
+            />
+            <p className="mt-1 text-xs text-muted-foreground">
+              This should be the address of the Docker host, not the Aegis container IP.
+            </p>
           </Field>
           {connectionType === "tls" ? (
             <>
